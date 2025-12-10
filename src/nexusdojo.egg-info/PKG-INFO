@@ -1,0 +1,68 @@
+Metadata-Version: 2.4
+Name: nexusdojo
+Version: 0.1.0
+Summary: Local CLI dojo for practicing Python and AI engineering workflows.
+Author: NexusDojo Team
+License: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+
+# NexusDojo CLI (Branch A)
+
+Local-first command-line scaffold for the NexusDojo "second brain." Built with standard-library tooling so it works offline and is easy to extend into a RAG pipeline. The CLI entrypoint is `dojo`.
+
+## Setup
+1. Create a virtual environment:
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   ```
+2. Install in editable mode (exposes the `dojo` command):
+   ```bash
+   pip install -e .
+   ```
+
+## Usage
+- Show help and commands:
+  ```bash
+  dojo --help
+  ```
+- Print a quickstart reminder:
+  ```bash
+  dojo hello
+  ```
+- Show the mentor system prompt (or any prompt file):
+  ```bash
+  dojo prompt --file system_prompts/senior_ai_mentor.md
+  ```
+- Inspect environment info:
+  ```bash
+  dojo info
+  ```
+- Create a local workspace skeleton for knowledge artifacts:
+  ```bash
+  dojo init --path ./nexusdojo_data
+  ```
+  Add `--force` to reuse a non-empty directory.
+- Build an API payload without sending it (demonstrates env vars):
+  ```bash
+  export NEXUSDOJO_API_KEY=sk-...
+  dojo api-dry-run --provider openai --message "Hello"
+  ```
+
+## Development
+- Run tests:
+  ```bash
+  python3 -m unittest
+  ```
+- Code lives under `src/nexusdojo`. Entry point is `nexusdojo/cli.py`.
+
+## Next steps
+- Wire a minimal local RAG loop (ingest text files, embed, query).
+- Add persistence (SQLite or a lightweight vector store) behind the CLI commands.
+- Layer prompts/agent workflows using the MCP protocol to coordinate tools.

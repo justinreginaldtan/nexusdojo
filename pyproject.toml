@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexusdojo"
+version = "0.1.0"
+description = "Local CLI dojo for practicing Python and AI engineering workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "NexusDojo Team"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+dojo = "nexusdojo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/nexusdojo/__init__.py
+src/nexusdojo/cli.py
+src/nexusdojo.egg-info/PKG-INFO
+src/nexusdojo.egg-info/SOURCES.txt
+src/nexusdojo.egg-info/dependency_links.txt
+src/nexusdojo.egg-info/entry_points.txt
+src/nexusdojo.egg-info/requires.txt
+src/nexusdojo.egg-info/top_level.txt
+tests/test_cli.py

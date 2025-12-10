@@ -1,0 +1,2 @@
+[console_scripts]
+dojo = nexusdojo.cli:main
