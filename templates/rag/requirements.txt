@@ -1,0 +1,4 @@
+# RAG specific libraries
+# chromadb
+# openai
+# langchain

@@ -1,4 +1,4 @@
-#!/Users/justintan/labubucode/nexusdojo/.venv/bin/python3
+#!/Users/justintan/labubucode/nexusdojo/.venv/bin/python3.11
 # -*- coding: utf-8 -*-
 import re
 import sys

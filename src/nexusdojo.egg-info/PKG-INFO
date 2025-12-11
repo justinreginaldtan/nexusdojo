@@ -14,7 +14,7 @@ Provides-Extra: dev
 
 # NexusDojo CLI (Branch A)
 
-Local-first command-line scaffold for the NexusDojo "second brain." Built with standard-library tooling so it works offline and is easy to extend into a RAG pipeline. The CLI entrypoint is `dojo`.
+Local-first command-line dojo for practicing Python/CLI/API skills with tiny katas. The CLI entrypoint is `dojo`.
 
 ## Setup
 1. Create a virtual environment:
@@ -24,7 +24,7 @@ Local-first command-line scaffold for the NexusDojo "second brain." Built with s
    ```
 2. Install in editable mode (exposes the `dojo` command):
    ```bash
-   pip install -e .
+   python3 -m pip install -e .
    ```
 
 ## Usage
@@ -36,9 +36,63 @@ Local-first command-line scaffold for the NexusDojo "second brain." Built with s
   ```bash
   dojo hello
   ```
+- Launch the zero-friction menu for common tasks:
+  ```bash
+  dojo menu
+  ```
+  The menu header shows last kata, weakest pillar, and hint quota remaining for the day.
+- Ask the idea picker to propose katas. Defaults to local Ollama (no API key needed) with `llama3.2:1b`:
+  ```bash
+  dojo idea
+  ```
+  Ensure the Ollama daemon is running and the model is pulled (e.g., `ollama pull llama3.2:1b`).
+  To use OpenRouter instead, set `NEXUSDOJO_API_KEY` and run:
+  ```bash
+  dojo idea --provider openrouter --model google/gemini-2.0-flash-001
+  ```
+- Check a session dashboard (weakest pillar, suggested next kata, recent activity):
+  ```bash
+  dojo dashboard
+  ```
+- Create a kata from a template (default: script; also: fastapi) with guided hints:
+  ```bash
+  # If you omit the idea, `dojo start` will ask for pillar/mode/level and call the idea picker.
+  dojo start "My Idea" --template fastapi --pillar api --level proficient --tests edge
+  ```
+  Use `--tests skip` to avoid seeding tests, or `--tests edge` for smoke + TODO edge cases.
+  Add `--reuse-settings` to reuse the last guided selections. Bad inputs reprompt; saying "n" to the idea confirmation cancels cleanly (use `--yes` to auto-accept).
+- Log what you did for a kata:
+  ```bash
+  dojo log my-idea --note "Implemented echo endpoint"
+  ```
+- Pull a concise, rate-limited hint (max 1/min, 5/day per kata by default):
+  ```bash
+  dojo hint my-idea --question "What's the riskiest edge to test?"
+  ```
+  Output shows remaining quota and labels offline fallbacks (`[offline fallback]`).
+- Generate edge-case test TODOs (skipped tests) without noise:
+  ```bash
+  dojo test-hints my-idea --offline  # use curated hints if models are offline
+  ```
+- Resume the last kata with a hint of what to do next:
+  ```bash
+  dojo continue
+  ```
+- Summarize recent logs and write a brief:
+  ```bash
+  dojo brief --since 2025-01-01
+  ```
+- Record a quick calibration (1-5) for a pillar:
+  ```bash
+  dojo calibrate --pillar api --score 3 --note "Need more error handling practice"
+  ```
 - Show the mentor system prompt (or any prompt file):
   ```bash
   dojo prompt --file system_prompts/senior_ai_mentor.md
+  ```
+- Append a manual transcript/scratch note (with optional summary):
+  ```bash
+  dojo transcript --text "Working through pagination edge cases" --summarize
   ```
 - Inspect environment info:
   ```bash
@@ -61,8 +115,8 @@ Local-first command-line scaffold for the NexusDojo "second brain." Built with s
   python3 -m unittest
   ```
 - Code lives under `src/nexusdojo`. Entry point is `nexusdojo/cli.py`.
+- Templates live under `templates/` (script, fastapi). Kata output root defaults to `./dojo/`. Notes and briefs default to `./notes/`.
 
 ## Next steps
-- Wire a minimal local RAG loop (ingest text files, embed, query).
-- Add persistence (SQLite or a lightweight vector store) behind the CLI commands.
-- Layer prompts/agent workflows using the MCP protocol to coordinate tools.
+- Add more templates (RAG stub, MCP server skeleton) once the core loop feels solid.
+- Layer prompts/agent workflows using the MCP protocol to coordinate tools (later).

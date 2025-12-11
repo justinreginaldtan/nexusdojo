@@ -8,6 +8,10 @@ version = "0.1.0"
 description = "Local CLI dojo for practicing Python and AI engineering workflows."
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "rich",
+    "watchdog",
+]
 license = {text = "MIT"}
 authors = [{name = "NexusDojo Team"}]
 classifiers = [

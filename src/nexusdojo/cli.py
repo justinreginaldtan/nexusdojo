@@ -15,9 +15,19 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+from rich.prompt import Prompt, Confirm
+from rich.markdown import Markdown
 
 from . import __version__
+
+# Initialize Rich console
+console = Console()
 
 # Default workspace location for local knowledge artifacts.
 DEFAULT_WORKSPACE = Path("./nexusdojo_data")
@@ -32,6 +42,9 @@ DEFAULT_IDEA_PROVIDER = "ollama"
 DEFAULT_IDEA_MODEL = "llama3.2:1b"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+# Relaxed rate limits (unlimited daily, short debounce)
+HINT_COOLDOWN_SECONDS = 5
+HINT_MAX_PER_DAY = 9999  # Effectively unlimited
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,8 +135,23 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--template",
         default="script",
-        choices=["script", "fastapi"],
+        choices=["script", "fastapi", "rag", "mcp"],
         help="Template to use for the new kata (default: script).",
+    )
+    start_parser.add_argument(
+        "--pillar",
+        default=None,
+        help="Focus pillar to steer the idea picker (python/cli/api/testing/mixed).",
+    )
+    start_parser.add_argument(
+        "--mode",
+        default=None,
+        help="Mode or template hint (script/api).",
+    )
+    start_parser.add_argument(
+        "--level",
+        default=None,
+        help="Difficulty hint (foundation/proficient/stretch).",
     )
     start_parser.add_argument(
         "--root",
@@ -140,7 +168,54 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow reusing an existing (empty) kata directory.",
     )
+    start_parser.add_argument(
+        "--guided",
+        action="store_true",
+        help="Force the guided start flow with explicit prompts.",
+    )
+    start_parser.add_argument(
+        "--reuse-settings",
+        action="store_true",
+        help="Reuse the last guided start settings without prompting.",
+    )
+    start_parser.add_argument(
+        "--tests",
+        choices=["edge", "smoke", "skip"],
+        default=None,
+        help="Test scaffolding preference: edge (smoke + TODOs), smoke only, or skip.",
+    )
+    start_parser.add_argument(
+        "--scaffold",
+        choices=["auto", "llm", "skip"],
+        default="auto",
+        help="Bootcamp-style scaffold: auto (LLM when interactive), llm, or skip.",
+    )
+    start_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip model calls and use curated offline ideas/scaffolds.",
+    )
+    start_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Auto-confirm the proposed idea without prompting (non-interactive safe).",
+    )
     start_parser.set_defaults(func=handle_start)
+
+    refresh_parser = subparsers.add_parser(
+        "scaffold-refresh",
+        help="Regenerate missing scaffold files for a kata without touching user code.",
+    )
+    refresh_parser.add_argument(
+        "project",
+        help="Slug of the kata to refresh.",
+    )
+    refresh_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    refresh_parser.set_defaults(func=handle_scaffold_refresh)
 
     idea_parser = subparsers.add_parser(
         "idea",
@@ -263,6 +338,152 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibrate_parser.set_defaults(func=handle_calibrate)
 
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="Show a session dashboard with progress signals.",
+    )
+    dashboard_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    dashboard_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    dashboard_parser.set_defaults(func=handle_dashboard)
+
+    continue_parser = subparsers.add_parser(
+        "continue",
+        help="Show the most recent kata and next-step hints.",
+    )
+    continue_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    continue_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    continue_parser.set_defaults(func=handle_continue)
+
+    transcript_parser = subparsers.add_parser(
+        "transcript",
+        help="Append a manual transcript or summary note.",
+    )
+    transcript_parser.add_argument(
+        "--text",
+        required=True,
+        help="Transcript text to record.",
+    )
+    transcript_parser.add_argument(
+        "--summarize",
+        action="store_true",
+        help="Also write a compact summary line.",
+    )
+    transcript_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    transcript_parser.set_defaults(func=handle_transcript)
+
+    hint_parser = subparsers.add_parser(
+        "hint",
+        help="Pull a concise, rate-limited hint for a kata.",
+    )
+    hint_parser.add_argument(
+        "project",
+        help="Slug of the kata to get a hint for.",
+    )
+    hint_parser.add_argument(
+        "--question",
+        default="",
+        help="Optional focus question for the hint.",
+    )
+    hint_parser.add_argument(
+        "--provider",
+        default=DEFAULT_IDEA_PROVIDER,
+        choices=["ollama", "openrouter"],
+        help="LLM provider to use for hints.",
+    )
+    hint_parser.add_argument(
+        "--model",
+        default=DEFAULT_IDEA_MODEL,
+        help="Model identifier to use.",
+    )
+    hint_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    hint_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    hint_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the prompt context without calling the model.",
+    )
+    hint_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip model calls and emit a curated fallback hint.",
+    )
+    hint_parser.set_defaults(func=handle_hint)
+
+    test_hint_parser = subparsers.add_parser(
+        "test-hints",
+        help="Generate edge-case test TODOs for a kata (skipped tests).",
+    )
+    test_hint_parser.add_argument(
+        "project",
+        help="Slug of the kata to target.",
+    )
+    test_hint_parser.add_argument(
+        "--max",
+        type=int,
+        default=4,
+        help="Maximum number of edge-case suggestions to materialize.",
+    )
+    test_hint_parser.add_argument(
+        "--provider",
+        default=DEFAULT_IDEA_PROVIDER,
+        choices=["ollama", "openrouter"],
+        help="LLM provider to use for test hints.",
+    )
+    test_hint_parser.add_argument(
+        "--model",
+        default=DEFAULT_IDEA_MODEL,
+        help="Model identifier to use.",
+    )
+    test_hint_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    test_hint_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    test_hint_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the prompt context without calling the model.",
+    )
+    test_hint_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Skip model calls and use curated edge-case hints.",
+    )
+    test_hint_parser.set_defaults(func=handle_test_hints)
+
     # Friendly menu when no command is provided.
     menu_parser = subparsers.add_parser(
         "menu",
@@ -270,7 +491,408 @@ def build_parser() -> argparse.ArgumentParser:
     )
     menu_parser.set_defaults(func=handle_menu)
 
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Run tests and get AI feedback.",
+    )
+    check_parser.add_argument(
+        "project",
+        nargs="?",
+        help="Slug of the kata to check (defaults to current directory).",
+    )
+    check_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    check_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    check_parser.set_defaults(func=handle_check)
+
+    watch_parser = subparsers.add_parser(
+        "watch",
+        help="Continuously run tests on file changes.",
+    )
+    watch_parser.add_argument(
+        "project",
+        nargs="?",
+        help="Slug of the kata to watch (defaults to current directory).",
+    )
+    watch_parser.add_argument(
+        "--root",
+        default=str(DEFAULT_KATA_ROOT),
+        help="Root directory where katas are stored.",
+    )
+    watch_parser.add_argument(
+        "--notes-root",
+        default=str(DEFAULT_NOTES_ROOT),
+        help="Directory for shared notes/logs.",
+    )
+    watch_parser.set_defaults(func=handle_watch)
+
     return parser
+
+
+def handle_watch(args: argparse.Namespace) -> int:
+    """
+    Watch for file changes and auto-run dojo check.
+    """
+    import time
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+
+    kata_root = Path(args.root).expanduser()
+    if args.project:
+        project_dir = kata_root / args.project
+    else:
+        project_dir = Path.cwd()
+
+    if not (project_dir / "tests").exists():
+        console.print(f"[bold red]Error:[/bold red] No 'tests' folder found in {project_dir}.")
+        return 1
+
+    console.print(Panel(
+        f"Watching [cyan]{project_dir}[/cyan]\n"
+        "Edit any .py file to trigger tests.\n"
+        "Press [bold]Ctrl+C[/bold] to stop.",
+        title="👀 SENSEI WATCH MODE",
+        border_style="blue"
+    ))
+
+    class TestRunnerHandler(FileSystemEventHandler):
+        def on_modified(self, event):
+            if event.src_path.endswith(".py"):
+                # Small debounce to avoid double-firing on some editors
+                time.sleep(0.1)
+                console.clear()
+                console.print(f"[dim]Change detected in {Path(event.src_path).name}...[/dim]")
+                # We call handle_check but suppress the return code to keep watching
+                try:
+                    handle_check(args)
+                except Exception as e:
+                    console.print(f"[red]Error running check: {e}[/red]")
+
+    event_handler = TestRunnerHandler()
+    observer = Observer()
+    observer.schedule(event_handler, str(project_dir), recursive=True)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        console.print("\n[blue]Watch stopped.[/blue]")
+    observer.join()
+    return 0
+
+
+def handle_check(args: argparse.Namespace) -> int:
+    """
+    Run tests for a kata, providing visual feedback and AI diagnosis on failure.
+    """
+    import subprocess
+
+    kata_root = Path(args.root).expanduser()
+    if args.project:
+        project_dir = kata_root / args.project
+    else:
+        project_dir = Path.cwd()
+
+    # Validate we are in a kata
+    if not (project_dir / "tests").exists():
+        console.print(f"[bold red]Error:[/bold red] No 'tests' folder found in {project_dir}. Are you in a kata directory?")
+        return 1
+    
+    console.print(f"[bold blue]Running tests for:[/bold blue] {project_dir.name}...")
+
+    # Run unittest
+    result = subprocess.run(
+        [sys.executable, "-m", "unittest"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode == 0:
+        # Success Case
+        console.print(Panel(
+            "[bold green]ALL TESTS PASSED[/bold green]\n\n"
+            "Great work, Engineer. The system is stable.",
+            title="✅ MISSION COMPLETE",
+            border_style="green",
+            box=box.DOUBLE
+        ))
+
+        # --- Progression System ---
+        kata_meta_path = project_dir / ".kata.json"
+        if kata_meta_path.exists():
+            try:
+                meta = json.loads(kata_meta_path.read_text())
+                pillar = meta.get("pillar", "mixed")
+                
+                console.print(f"[bold]Rate this drill ([cyan]{pillar.upper()}[/cyan]):[/bold]")
+                console.print("[1] Too Easy  (Speed +5 XP)")
+                console.print("[2] Perfect   (Growth +15 XP)")
+                console.print("[3] Too Hard  (Grit +20 XP)")
+                
+                rating = Prompt.ask("Rating", choices=["1", "2", "3"], default="2")
+                
+                xp_gain, new_level = update_skill(Path(args.notes_root), pillar, rating)
+                
+                console.print(Panel(
+                    f"XP Gained: [bold gold1]+{xp_gain}[/bold gold1]\n"
+                    f"New Level: [bold cyan]{new_level}[/bold cyan]",
+                    title="🆙 LEVEL UP",
+                    border_style="gold1"
+                ))
+            except Exception as e:
+                console.print(f"[dim]XP update failed: {e}[/dim]")
+
+        # Auto-log prompt
+        if Confirm.ask("Log this victory?"):
+            note = Prompt.ask("What did you learn/build?")
+            handle_log(argparse.Namespace(
+                project=project_dir.name,
+                note=note,
+                root=str(kata_root),
+                notes_root=str(args.notes_root)
+            ))
+        return 0
+
+    else:
+        # Failure Case
+        console.print(Panel(
+            "[bold red]TESTS FAILED[/bold red]",
+            title="❌ SYSTEM ALERT",
+            border_style="red",
+            box=box.HEAVY
+        ))
+        
+        # Show specific errors (truncated if too long)
+        error_out = result.stderr or result.stdout
+        console.print(f"[dim]{error_out.strip()}[/dim]")
+        
+        console.print("\n[bold yellow]Analyzing failure...[/bold yellow]")
+        
+        # AI Diagnosis
+        diagnosis = get_failure_diagnosis(
+            project_dir.name, 
+            error_out, 
+            Path(args.notes_root)
+        )
+        
+        console.print(Panel(
+            diagnosis,
+            title="🤖 Sensei Diagnosis",
+            border_style="yellow",
+            padding=(1, 2)
+        ))
+        return 1
+
+
+# --- Skill / XP System ---
+
+def load_skills(notes_root: Path) -> dict[str, int]:
+    path = notes_root / "skills.json"
+    if not path.exists():
+        return {"python": 0, "cli": 0, "api": 0, "testing": 0, "mixed": 0}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {"python": 0, "cli": 0, "api": 0, "testing": 0, "mixed": 0}
+
+def save_skills(notes_root: Path, skills: dict[str, int]) -> None:
+    path = notes_root / "skills.json"
+    path.write_text(json.dumps(skills, indent=2))
+
+def get_level_info(xp: int) -> tuple[str, str]:
+    """Returns (Level Title, Next Level Progress)."""
+    if xp < 100:
+        return "Novice", f"{xp}/100"
+    elif xp < 300:
+        return "Apprentice", f"{xp}/300"
+    elif xp < 600:
+        return "Journeyman", f"{xp}/600"
+    elif xp < 1000:
+        return "Expert", f"{xp}/1000"
+    else:
+        return "Master", "MAX"
+
+def update_skill(notes_root: Path, pillar: str, rating: str) -> tuple[int, str]:
+    """
+    Updates XP based on difficulty rating.
+    Rating: 1=Easy, 2=Perfect, 3=Hard.
+    Returns (XP Gained, New Level Title).
+    """
+    skills = load_skills(notes_root)
+    current_xp = skills.get(pillar, 0)
+    
+    # Base XP for completion = 10
+    # Modifiers: Easy=+5, Perfect=+15, Hard=+20
+    gains = {"1": 15, "2": 25, "3": 30}
+    gain = gains.get(rating, 10)
+    
+    new_xp = current_xp + gain
+    skills[pillar] = new_xp
+    save_skills(notes_root, skills)
+    
+    level_title, _ = get_level_info(new_xp)
+    return gain, f"{level_title} ({new_xp} XP)"
+
+
+def get_failure_diagnosis(project_name: str, traceback: str, notes_root: Path) -> str:
+    """
+    Ask the AI to explain the traceback simply.
+    """
+    system = (
+        "You are a senior python engineer. Analyze the traceback and give a ONE sentence hint "
+        "on what might be wrong. Do not give the full code fix. Focus on the logic error."
+    )
+    user = f"Project: {project_name}\nTraceback:\n{traceback[-2000:]}" # Send last 2000 chars
+    
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user}
+    ]
+    
+    # Reuse existing API call logic
+    hint = call_idea_api(DEFAULT_IDEA_PROVIDER, DEFAULT_IDEA_MODEL, messages)
+    if not hint:
+        return "Could not reach the AI for diagnosis. Check the traceback above."
+    return hint
+
+
+def generate_mission_spec(
+    project_dir: Path,
+    idea_line: str,
+    pillar_hint: Optional[str],
+    level_hint: Optional[str],
+    template: str,
+    notes_root: Path,
+    offline: bool = False,
+) -> tuple[str, list[str], bool]:
+    """
+    Generate a structured MISSION.md and acceptance criteria using the LLM.
+    """
+    idea_title = strip_idea_prefix(idea_line)
+    
+    system = (
+        "You are a Senior Product Manager/Architect for an AI solutions company. "
+        "Your task is to define a clear mission for a junior engineer. "
+        "Return ONLY a JSON object with the following keys:\n"
+        "- 'goal': (string) A concise, actionable goal for the project.\n"
+        "- 'inputs': (list of strings) Describe any required inputs (e.g., 'A string representing a log line').\n"
+        "- 'outputs': (list of strings) Describe expected outputs (e.g., 'A dictionary of parsed log components').\n"
+        "- 'constraints': (list of strings) Non-functional requirements like 'Handle all file I/O errors gracefully', 'Ensure type hints are used', 'Must be performant for large inputs'.\n"
+        "- 'acceptance_criteria': (list of strings) Short, testable statements like 'Function must return correct value for valid input', 'Function must raise ValueError for invalid input'.\n"
+        "Keep it concise, professional, and focus on testable outcomes. No conversational fluff, just JSON."
+    )
+    user = (
+        f"Generate a mission specification for a kata with the following details:\n"
+        f"Idea: {idea_title}\n"
+        f"Pillar: {pillar_hint or 'unspecified'}\n"
+        f"Level: {level_hint or 'unspecified'}\n"
+        f"Template: {template}\n"
+        "Return JSON only."
+    )
+    
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user}
+    ]
+    
+    spec_json = None
+    fallback_used = False
+    if not offline:
+        content = call_idea_api(DEFAULT_IDEA_PROVIDER, DEFAULT_IDEA_MODEL, messages)
+        if content:
+            try:
+                spec_json = json.loads(content)
+            except json.JSONDecodeError:
+                console.print(f"[red]Error parsing mission spec JSON:[/red] {content[:200]}...", file=sys.stderr)
+
+    if not spec_json:
+        fallback_used = True
+        console.print("[yellow]LLM failed to generate mission spec; using deterministic fallback.[/yellow]", file=sys.stderr)
+        spec_json = {
+            "goal": f"Implement a {idea_title} based on standard Python practices.",
+            "inputs": ["Varies by project idea."],
+            "outputs": ["Varies by project idea."],
+            "constraints": ["Ensure type hints are used.", "Handle edge cases gracefully."],
+            "acceptance_criteria": [
+                f"Basic functionality for {idea_title} works as expected.",
+                "Code adheres to Python best practices (e.g., PEP8).",
+            ],
+        }
+
+    # Write MISSION.md
+    md_lines = [
+        f"# Mission: {spec_json.get('goal', idea_title)}",
+        "",
+        "## Overview",
+        spec_json.get("goal", "Implement the core logic for this kata."),
+        "",
+        "## Inputs",
+        *[f"- {i}" for i in spec_json.get("inputs", [])],
+        "",
+        "## Outputs",
+        *[f"- {o}" for o in spec_json.get("outputs", [])],
+        "",
+        "## Constraints",
+        *[f"- {c}" for c in spec_json.get("constraints", [])],
+        "",
+        "## Acceptance Criteria (Tests)",
+        *[f"- {ac}" for ac in spec_json.get("acceptance_criteria", [])],
+        "",
+        "## Quickstart",
+        "1. Read this `MISSION.md` carefully.",
+        "2. Implement your solution in `main.py`.",
+        "3. Run tests using `dojo check` to verify acceptance criteria.",
+        "4. Log your progress: `dojo log <kata-slug> --note \"...\"`",
+        "5. Once complete: `dojo check` to pass all tests, then log your victory!",
+    ]
+    (project_dir / "MISSION.md").write_text("\n".join(md_lines))
+
+    # Write test_mission.py
+    acceptance_criteria = spec_json.get("acceptance_criteria", [])
+    tests_dir = project_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    test_file_path = tests_dir / "test_mission.py"
+    
+    test_lines = [
+        '"""Auto-generated mission tests. Implement these to complete the kata."""',
+        "import unittest",
+        "import main # Assuming main.py contains your logic",
+        "",
+        "class MissionTests(unittest.TestCase):",
+    ]
+    
+    for idx, criteria in enumerate(acceptance_criteria):
+        safe_criteria = summarize_text(criteria, 80).replace("'", "\"")
+        test_lines.extend([
+            f"    @unittest.skip(f'TODO: Implement for: {safe_criteria}')",
+            f"    def test_acceptance_criteria_{idx + 1}(self):",
+            f"        # Test: {criteria}",
+            "        self.fail('Test not implemented yet')",
+            "",
+        ])
+    
+    # Add a final placeholder test if no criteria were generated
+    if not acceptance_criteria:
+         test_lines.extend([
+            f"    @unittest.skip(f'TODO: Implement mission for: {idea_title}')",
+            f"    def test_mission_placeholder(self):",
+            f"        self.fail('Mission tests not generated or implemented')",
+            "",
+        ])
+    
+    test_file_path.write_text("\n".join(test_lines))
+
+    return "\n".join(md_lines), acceptance_criteria, fallback_used
 
 
 def handle_hello(_: argparse.Namespace) -> int:
@@ -282,18 +904,138 @@ def handle_hello(_: argparse.Namespace) -> int:
     return 0
 
 
-def handle_info(_: argparse.Namespace) -> int:
+def handle_info(args: argparse.Namespace) -> int:
     """
-    Display environment information useful for debugging.
+    Display environment info and allow editing profile settings.
     """
-    print(f"NexusDojo CLI v{__version__}")
-    print(f"Python: {sys.version.split()[0]}")
-    print(f"Platform: {platform.platform()}")
-    print(f"Working directory: {Path.cwd()}")
-    print(f"Default workspace: {DEFAULT_WORKSPACE}")
-    print(f"Default kata root: {DEFAULT_KATA_ROOT}")
-    print(f"Default notes root: {DEFAULT_NOTES_ROOT}")
+    console.print(Panel(f"NexusDojo CLI v{__version__}", title="System Info", border_style="blue"))
+    
+    # Environment stats
+    table = Table(box=box.SIMPLE)
+    table.add_column("Key", style="cyan")
+    table.add_column("Value", style="white")
+    table.add_row("Python", sys.version.split()[0])
+    table.add_row("Platform", platform.platform())
+    table.add_row("Working Dir", str(Path.cwd()))
+    table.add_row("Kata Root", str(DEFAULT_KATA_ROOT))
+    console.print(table)
+    console.print()
+
+    # User Settings
+    notes_root = getattr(args, "notes_root", str(DEFAULT_NOTES_ROOT))
+    if notes_root:
+        notes_path = Path(notes_root)
+        settings = load_settings(notes_path)
+        current_name = settings.get("user_name", "Engineer")
+        
+        console.print(f"[bold]Current Profile Name:[/bold] {current_name}")
+        
+        if Confirm.ask("Would you like to change your display name?"):
+            new_name = Prompt.ask("Enter new name").strip()
+            if new_name:
+                settings["user_name"] = new_name
+                save_settings(notes_path, settings)
+                console.print(f"[green]Name updated to {new_name}.[/green]")
+            else:
+                console.print("Name unchanged.")
+    
     return 0
+
+
+def handle_help(_: argparse.Namespace) -> int:
+    """
+    Display the recommended workflow and help guide.
+    """
+    guide = """
+# 🥋 The NexusDojo Workflow
+
+**Goal:** Frictionless training loop to build "Muscle Memory".
+
+### 1. ⚡ Quick Train
+Start every session with **[1] Quick Train** from the menu.
+The AI analyzes your skills and generates a tailored mission.
+
+### 2. 📜 Read the Mission
+Go to the kata folder:
+`cd dojo/<kata-slug>`
+Read `MISSION.md`. Understand the **Inputs**, **Outputs**, and **Constraints**.
+
+### 3. 👀 Sensei Watch Mode
+Open a split pane and run:
+`dojo watch`
+This will auto-run tests every time you save.
+
+### 4. ⌨️  Code (The Vibe)
+Open `main.py` in Neovim.
+Write code -> Save -> Green Light.
+If Red: Read the AI diagnosis in the watch pane.
+
+### 5. 📝 Log & Level Up
+Once passed, the system will ask to log your victory.
+Rate the difficulty to adjust future drills:
+- **Too Easy:** +5 XP (Speed)
+- **Perfect:** +15 XP (Growth)
+- **Too Hard:** +20 XP (Grit)
+
+---
+*Tip: Use `dojo hint` if you get stuck.*
+    """
+    console.print(Panel(Markdown(guide), title="Recommended Workflow", border_style="green"))
+    Prompt.ask("Press Enter to return to menu")
+    return 0
+
+
+def run_onboarding(notes_root: Path) -> int:
+    """
+    Run the first-time setup wizard.
+    """
+    console.clear()
+    console.print(Panel(
+        "[bold gold1]INITIALIZING SYSTEM...[/bold gold1]\n\n"
+        "Welcome to [bold white]NEXUS DOJO[/bold white].\n"
+        "This is not just a tool. It is a simulation of your future job.\n"
+        "We are here to build your muscle memory and engineering intuition.",
+        title="👋 WELCOME",
+        border_style="blue",
+        padding=(1, 2)
+    ))
+    
+    if not Confirm.ask("\nReady to configure your profile?"):
+        console.print("[dim]Exiting... Come back when you are ready to train.[/dim]")
+        return 0
+
+    # 1. Profile Setup
+    console.print("\n[bold cyan]Step 1: Identity[/bold cyan]")
+    name = Prompt.ask("What should the system call you?", default="Engineer")
+    
+    # Save Settings
+    settings = {"user_name": name}
+    save_settings(notes_root, settings)
+    
+    # Initialize XP
+    skills = {"python": 0, "cli": 0, "api": 0, "testing": 0, "mixed": 0}
+    save_skills(notes_root, skills)
+    
+    console.print(f"\n[green]Identity confirmed: {name}. Access granted.[/green]")
+    
+    # 2. Workflow Intro
+    console.print("\n[bold cyan]Step 2: The Protocol[/bold cyan]")
+    console.print("Your goal is to reach [bold]Master[/bold] rank. To do that, you must train.")
+    console.print("Here is the recommended workflow:\n")
+    
+    guide = """
+    1. **⚡ Quick Train:** The AI picks a drill for your weakest skill.
+    2. **📜 Mission:** Read `MISSION.md` (Your ticket).
+    3. **👀 Watch:** Run `dojo watch` to auto-test your code.
+    4. **⌨️  Code:** Solve the problem.
+    5. **✅ Log:** Rate difficulty to gain XP.
+    """
+    console.print(Markdown(guide))
+    
+    Prompt.ask("\nPress Enter to enter the Dojo")
+    
+    # Redirect to main menu
+    return handle_menu(argparse.Namespace())
 
 
 def handle_init(args: argparse.Namespace) -> int:
@@ -371,60 +1113,329 @@ def handle_api_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+
+
+
 def handle_start(args: argparse.Namespace) -> int:
     """
     Create a kata from a template and stamp it with basic metadata.
     """
     idea = (args.idea or "").strip()
-    if not idea:
-        print("No idea provided; using idea picker...", file=sys.stderr)
-        picked = pick_idea(
-            provider=DEFAULT_IDEA_PROVIDER,
-            model=DEFAULT_IDEA_MODEL,
-            kata_root=Path(args.root).expanduser(),
-            notes_root=Path(args.notes_root).expanduser(),
-        )
-        if not picked:
-            print("Idea picker failed; please provide an idea manually.", file=sys.stderr)
-            return 1
-        idea = picked
-        print(f"Using idea: {idea}")
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+    notes_root.mkdir(parents=True, exist_ok=True)
 
-    slug = slugify(idea)
+    stored_settings = load_settings(notes_root)
+    pillar_hint = args.pillar or stored_settings.get("pillar")
+    level_hint = args.level or stored_settings.get("level")
+    mode_hint = args.mode or stored_settings.get("mode")
+    tests_pref = args.tests or stored_settings.get("tests")
+    scaffold_mode = args.scaffold
+    offline_mode = bool(getattr(args, "offline", False))
+    interactive = sys.stdin.isatty()
+
+    prompt_user = (args.guided or not idea) and interactive
+    if args.reuse_settings and not stored_settings and prompt_user:
+        console.print("[yellow]No saved settings found; switching to guided prompts.[/yellow]", file=sys.stderr)
+        args.reuse_settings = False
+
+    if prompt_user and not args.reuse_settings:
+        pillar_hint = Prompt.ask(
+            "Focus pillar (python/cli/api/testing/mixed)",
+            default=pillar_hint or "mixed",
+            choices=["python", "cli", "api", "testing", "mixed"],
+        )
+        mode_hint = Prompt.ask(
+            "Mode/template (script/fastapi/rag/mcp)",
+            default=mode_hint or "script",
+            choices=["script", "fastapi", "rag", "mcp"],
+        )
+        level_hint = Prompt.ask(
+            "Difficulty (foundation/proficient/stretch)",
+            default=level_hint or "foundation",
+            choices=["foundation", "proficient", "stretch"],
+        )
+        tests_pref = Prompt.ask(
+            "Test scaffolding (edge/smoke/skip)",
+            default=tests_pref or "edge",
+            choices=["edge", "smoke", "skip"],
+        )
+        save_settings(
+            notes_root,
+            {
+                "pillar": pillar_hint,
+                "mode": mode_hint,
+                "level": level_hint,
+                "tests": tests_pref,
+            },
+        )
+
+    console.print(
+        f"Settings: [cyan]pillar={pillar_hint or 'mixed'}[/cyan]"
+        f" [cyan]mode={mode_hint or 'script'}[/cyan]"
+        f" [cyan]level={level_hint or 'foundation'}[/cyan]"
+        f" [cyan]tests={tests_pref or ('edge' if prompt_user else 'smoke')}[/cyan]"
+        f" [cyan]offline={'yes' if offline_mode else 'no'}[/cyan]"
+    )
+    resolved_template = resolve_template(args.template, mode_hint)
+    if not idea:
+        selected_idea: Optional[str] = None
+        if prompt_user and not args.yes:
+            if offline_mode:
+                console.print("[yellow]Offline mode: skipping model calls for ideas.[/yellow]", file=sys.stderr)
+            with console.status("[bold green]Picking kata idea...[/bold green]", spinner="dots"):
+                options, options_fallback = pick_idea_options(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=kata_root,
+                    notes_root=notes_root,
+                    pillar_hint=pillar_hint,
+                    level_hint=level_hint,
+                    mode_hint=mode_hint,
+                    max_options=3,
+                    offline=offline_mode,
+                )
+            if options:
+                console.print("Pick a kata:")
+                for idx, opt in enumerate(options, start=1):
+                    console.print(f"[cyan]{idx})[/cyan] {strip_idea_prefix(opt)}")
+                console.print("[cyan]m)[/cyan] Manual idea")
+                console.print("[cyan]c)[/cyan] Cancel")
+                choice = Prompt.ask("Choose", default="1").strip().lower()
+                if choice in {"c", "cancel"}:
+                    console.print("Canceled.")
+                    return 0
+                if choice.startswith("m"):
+                    manual = Prompt.ask("Enter your idea").strip()
+                    if not manual:
+                        console.print("No idea provided. Canceled.")
+                        return 0
+                    selected_idea = normalize_idea_line(manual)
+                else:
+                    try:
+                        choice_idx = int(choice)
+                    except ValueError:
+                        choice_idx = 1
+                    choice_idx = max(1, min(choice_idx, len(options)))
+                    selected_idea = normalize_idea_line(options[choice_idx - 1])
+                if options_fallback:
+                    console.print("[yellow]Note: LLM idea picker unavailable; used curated options.[/yellow]", file=sys.stderr)
+        if not selected_idea:
+            console.print("[yellow]No idea provided; using adaptive idea picker...[/yellow]", file=sys.stderr)
+            with console.status("[bold green]Generating idea...[/bold green]", spinner="dots"):
+                picked, used_fallback = pick_idea_with_hints(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=kata_root,
+                    notes_root=notes_root,
+                    pillar_hint=pillar_hint,
+                    level_hint=level_hint,
+                    mode_hint=mode_hint,
+                    offline=offline_mode,
+                )
+            if not picked:
+                console.print("[yellow]Idea picker failed; using curated fallback.[/yellow]", file=sys.stderr)
+                picked = fallback_idea(
+                    pillar_hint=pillar_hint,
+                    level_hint=level_hint,
+                    mode_hint=mode_hint,
+                )
+            if not picked:
+                console.print("[red]Unable to generate an idea. Please provide one manually.[/red]", file=sys.stderr)
+                return 1
+            selected_idea = normalize_idea_line(picked)
+            if used_fallback:
+                console.print("[yellow]Note: LLM idea picker unavailable; used curated fallback.[/yellow]", file=sys.stderr)
+        idea = selected_idea
+
+    idea_line = normalize_idea_line(idea)
+    idea_title = strip_idea_prefix(idea_line)
+    slug_base = slugify(idea_title)
+    slug = slug_base
     if not slug:
-        print("Idea is empty after slugifying; provide a short description.", file=sys.stderr)
+        console.print("[red]Idea is empty after slugifying; provide a short description.[/red]", file=sys.stderr)
         return 1
 
-    kata_root = Path(args.root).expanduser()
     kata_root.mkdir(parents=True, exist_ok=True)
     target_dir = kata_root / slug
 
     if target_dir.exists() and any(target_dir.iterdir()) and not args.force:
-        print(
-            f"Kata directory {target_dir} exists and is not empty. Use --force to reuse it.",
-            file=sys.stderr,
-        )
-        return 1
+        alt_slug = next_available_slug(slug_base, kata_root)
+        if not sys.stdin.isatty() or args.yes:
+            console.print(f"[yellow]Kata directory {target_dir} exists; using alternate slug {alt_slug}.[/yellow]")
+            slug = alt_slug
+            target_dir = kata_root / slug
+        else:
+            console.print(f"Kata directory [cyan]{target_dir}[/cyan] exists and is not empty.")
+            choice = Prompt.ask(f"Options: [r] reuse (force), [n] new slug {alt_slug} (default), [c] cancel", default="n").strip().lower()
+            if choice.startswith("r"):
+                args.force = True
+            elif choice.startswith("c"):
+                console.print("Canceled.")
+                return 0
+            else:
+                slug = alt_slug
+                target_dir = kata_root / slug
+                console.print(f"Using alternate slug: [cyan]{slug}[/cyan]")
 
-    template_dir = TEMPLATES_ROOT / args.template
+    template_dir = TEMPLATES_ROOT / resolved_template
     if not template_dir.exists():
-        print(f"Template not found: {template_dir}", file=sys.stderr)
+        console.print(f"[red]Template not found: {template_dir}[/red]", file=sys.stderr)
         return 1
 
     shutil.copytree(template_dir, target_dir, dirs_exist_ok=args.force)
 
     replacements = {
-        "IDEA": idea,
+        "IDEA": idea_title,
         "SLUG": slug,
-        "TEMPLATE": args.template,
+        "TEMPLATE": resolved_template,
         "CREATED_AT": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
-    readme_path = target_dir / "README.md"
-    if readme_path.exists():
-        apply_placeholders(readme_path, replacements)
+    apply_placeholders_tree(target_dir, replacements)
 
-    print(f"Created kata at {target_dir}")
+    scaffolded = False
+    should_scaffold = (
+        resolved_template in {"script", "fastapi"}
+        and scaffold_mode in {"auto", "llm"}
+        and (interactive or scaffold_mode == "llm")
+    )
+    fallback_used_scaffold = False
+    if should_scaffold:
+        spec, fallback_used_scaffold = generate_scaffold_spec(
+            idea_line=idea_line,
+            pillar_hint=pillar_hint,
+            level_hint=level_hint,
+            template=resolved_template,
+            offline=offline_mode,
+        )
+        if spec:
+            apply_kata_scaffold(target_dir, spec, template=resolved_template, overwrite_existing=True)
+            scaffolded = True
+    
+    # Generate MISSION.md and test_mission.py
+    mission_md_content, acceptance_criteria, fallback_used_mission = generate_mission_spec(
+        project_dir=target_dir,
+        idea_line=idea_line,
+        pillar_hint=pillar_hint,
+        level_hint=level_hint,
+        template=resolved_template,
+        notes_root=notes_root,
+        offline=offline_mode,
+    )
+    console.print(f"Generated [green]MISSION.md[/green] and [green]test_mission.py[/green] for: [bold]{idea_title}[/bold]")
+    if fallback_used_mission:
+        console.print("[yellow]Note: LLM unavailable for mission spec; using curated fallback.[/yellow]", file=sys.stderr)
+
+    # Set default main.py content for new templates if needed
+    if resolved_template in {"rag", "mcp"} and not (target_dir / "main.py").read_text().strip():
+        set_default_main_py_content(target_dir, resolved_template, idea_title)
+
+    # Write metadata for progression tracking
+    (target_dir / ".kata.json").write_text(json.dumps({
+        "pillar": pillar_hint or "mixed",
+        "level": level_hint or "foundation",
+        "template": resolved_template,
+        "created_at": datetime.now().isoformat()
+    }, indent=2))
+
+    effective_tests_pref = tests_pref or ("edge" if prompt_user else "smoke")
+    if effective_tests_pref != "skip":
+        seed_test_scaffold(target_dir, resolved_template, idea_line, include_edge=(effective_tests_pref == "edge"))
+
+    console.print(f"Created kata at [green]{target_dir}[/green]")
+    if scaffolded:
+        console.print("[green]Scaffolded: kata.md, stubs, and focused tests generated.[/green]")
+        if fallback_used_scaffold:
+            console.print("[yellow]Note: LLM scaffold unavailable; used deterministic fallback.[/yellow]", file=sys.stderr)
+    if effective_tests_pref != "skip":
+        console.print("[green]Tests seeded: Run `dojo check` to verify.[/green]")
+    console.print(
+        "[bold blue]Next steps:[/bold blue]\n"
+        f"- [bold]cd {target_dir.name}[/bold]\n"
+        "- Read [green]MISSION.md[/green] for your task.\n"
+        "- Code your solution in [green]main.py[/green].\n"
+        "- Run [bold yellow]dojo check[/bold yellow] to get instant feedback from your Sensei."
+    )
     return 0
+
+
+def set_default_main_py_content(target_dir: Path, template: str, idea_title: str) -> None:
+    """
+    Sets a default main.py content for new templates if they are empty after copy.
+    """
+    main_py_path = target_dir / "main.py"
+    if template == "rag":
+        content = f'''"""RAG Kata: {idea_title}"""
+from typing import List, Dict
+
+def retrieve_context(query: str, top_k: int = 3) -> List[str]:
+    """
+    Simulates retrieving relevant text chunks from a vector database.
+    Implement your RAG logic here (e.g., using ChromaDB, FAISS).
+    """
+    # TODO: Implement actual RAG retrieval
+    return [f"Context for '{{query}}' chunk {{i+1}}" for i in range(top_k)]
+
+def generate_response(query: str, context: List[str]) -> str:
+    """
+    Simulates generating a response using an LLM based on query and context.
+    """
+    # TODO: Implement LLM call with RAG context
+    return f"Response to '{{query}}' based on context: {{context}}"
+
+def main():
+    print("RAG Pipeline Kata: Implement retrieve_context and generate_response.")
+    print("Run tests in the 'tests' folder.")
+
+if __name__ == "__main__":
+    main()
+'''
+    elif template == "mcp":
+        content = f'''"""MCP Server Kata: {idea_title}"""
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Dict, Any
+
+app = FastAPI(title="Micro-Capability Protocol Server")
+
+class ToolRequest(BaseModel):
+    tool_name: str
+    tool_args: Dict[str, Any]
+
+@app.get("/health")
+async def health():
+    return {{"status": "ok"}}
+
+@app.post("/execute_tool")
+async def execute_tool(request: ToolRequest):
+    """
+    Executes a specific tool/capability based on the request.
+    TODO: Implement your tools here (e.g., search, calculator, data lookup).
+    """
+    if request.tool_name == "example_tool":
+        # Example tool implementation
+        result = {{"message": f"Executed {{request.tool_name}} with args: {{request.tool_args}}"}}
+        return result
+    else:
+        return {{"error": f"Tool '{{request.tool_name}}' not found."}}
+
+def main():
+    print("MCP Server Kata: Implement and expose micro-capabilities via HTTP.")
+    print("Run tests in the 'tests' folder, then `uvicorn main:app --reload`.")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+'''
+    else:
+        content = f'''"""Kata: {idea_title}"""
+def main():
+    print("Implement your kata logic here.")
+
+if __name__ == "__main__":
+    main()
+'''
+    main_py_path.write_text(content)
 
 
 def handle_log(args: argparse.Namespace) -> int:
@@ -512,95 +1523,412 @@ def handle_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_dashboard(args: argparse.Namespace) -> int:
+    """
+    Show a compact dashboard with practice signals and hints.
+    """
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+
+    katas = list_katas(kata_root)
+    recent = latest_activity(kata_root, notes_root)
+    calib_path = notes_root / "calibrations.md"
+    scores = parse_calibrations(calib_path) if calib_path.exists() else {}
+    trend = calibration_trend(calib_path) if calib_path.exists() else {}
+    weakest = weakest_pillar(scores)
+    suggestion = fallback_idea(pillar_hint=weakest, level_hint="foundation", mode_hint=None)
+    settings = load_settings(notes_root)
+    balance = practice_balance(scores)
+
+    print("NexusDojo dashboard")
+    print(f"- Katas: {len(katas)} ({', '.join(katas[-3:]) or 'none'})")
+    print(f"- Weakest pillar: {weakest or 'unknown'} | Trend: {trend or 'no history'}")
+    print(f"- Practice balance: {balance or 'log a calibration to start'}")
+    if recent:
+        project, ts, note = recent
+        print(f"- Continue: {project} (last at {ts}) -> {note}")
+    else:
+        print("- Continue: none yet, start a kata to unlock suggestions.")
+    if suggestion:
+        print(f"- Suggested next kata: {suggestion}")
+    if settings:
+        print(f"- Last guided defaults: pillar={settings.get('pillar')} mode={settings.get('mode')} level={settings.get('level')} tests={settings.get('tests')}")
+    print(f"- Idea picker defaults: provider={DEFAULT_IDEA_PROVIDER}, model={DEFAULT_IDEA_MODEL}")
+    return 0
+
+
+def handle_continue(args: argparse.Namespace) -> int:
+    """
+    Show the most recent kata and where to resume.
+    """
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+    recent = latest_activity(kata_root, notes_root)
+    if not recent:
+        print("No activity found yet. Start a kata with `dojo start`.", file=sys.stderr)
+        return 1
+    project, ts, note = recent
+    project_dir = kata_root / project
+    readme = project_dir / "README.md"
+    if readme.exists():
+        lines = readme.read_text().splitlines()
+        brief = lines[0] if lines else "README is empty."
+        brief = brief.lstrip("# ").strip() or brief
+    else:
+        brief = "README not found yet."
+    print("Resume kata")
+    print(f"- Project: {project}")
+    print(f"- Last activity: {ts} -> {note}")
+    print(f"- Path: {project_dir.resolve()}")
+    print(f"- Brief: {brief}")
+    log_hint = project_dir / "LOG.md"
+    print(f"- Next: open code, run tests (`python -m unittest`), then `dojo log {project} --note \"...\"`.")
+    if log_hint.exists():
+        last_log = last_lines(log_hint, 3)
+        if last_log:
+            print(f"- Recent log lines:\n{last_log}")
+    return 0
+
+
+def handle_transcript(args: argparse.Namespace) -> int:
+    """
+    Append a manual transcript entry, optionally with a lightweight summary.
+    """
+    notes_root = Path(args.notes_root).expanduser()
+    notes_root.mkdir(parents=True, exist_ok=True)
+    transcript_path = notes_root / "transcript.md"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"- [{timestamp}] {args.text}"]
+    if args.summarize:
+        lines.append(f"  Summary: {summarize_text(args.text)}")
+    append_line(transcript_path, "\n".join(lines) + "\n")
+    print(f"Transcript updated: {transcript_path}")
+    return 0
+
+
+def handle_hint(args: argparse.Namespace) -> int:
+    """
+    Pull a concise hint for a kata with rate limiting and fallbacks.
+    """
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+    project_dir = kata_root / args.project
+    if not project_dir.exists():
+        print(f"Kata not found at {project_dir}", file=sys.stderr)
+        return 1
+
+    allowed, wait_msg, remaining = check_hint_rate_limit(args.project, notes_root)
+    if not allowed:
+        print(wait_msg, file=sys.stderr)
+        return 1
+
+    messages = build_hint_prompt(project_dir, notes_root, args.question)
+    if args.dry_run:
+        print("System prompt:")
+        print(messages[0]["content"])
+        print("\nUser prompt:")
+        print(messages[1]["content"])
+        return 0
+
+    hint = None
+    if not args.offline:
+        hint = call_idea_api(
+            provider=args.provider,
+            model=args.model,
+            messages=messages,
+        )
+    fallback_used = False
+    if not hint:
+        hint = fallback_hint(args.question)
+        fallback_used = True
+        print("Model unavailable; using curated fallback.", file=sys.stderr)
+
+    record_hint_use(args.project, notes_root)
+    label = "Hint"
+    if args.offline or fallback_used:
+        label += " [offline fallback]"
+    quota_line = f"(remaining today: {remaining})" if remaining is not None else ""
+    print(f"{label} {quota_line}".strip())
+    print(hint.strip())
+    return 0
+
+
+def handle_test_hints(args: argparse.Namespace) -> int:
+    """
+    Generate edge-case test TODOs (skipped) for a kata.
+    """
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+    project_dir = kata_root / args.project
+    if not project_dir.exists():
+        print(f"Kata not found at {project_dir}", file=sys.stderr)
+        return 1
+
+    messages = build_test_hint_prompt(project_dir, notes_root, args.max)
+    if args.dry_run:
+        print("System prompt:")
+        print(messages[0]["content"])
+        print("\nUser prompt:")
+        print(messages[1]["content"])
+        return 0
+
+    content = None
+    if not args.offline:
+        content = call_idea_api(
+            provider=args.provider,
+            model=args.model,
+            messages=messages,
+        )
+    fallback_used = args.offline
+    hints = parse_bullet_list(content) if content else None
+    if not hints:
+        hints = fallback_edge_hints(project_dir)
+        fallback_used = True
+        print("Model unavailable; using curated edge-case hints.", file=sys.stderr)
+    if args.max and len(hints) > args.max:
+        hints = hints[: args.max]
+
+    write_edge_hint_tests(project_dir, hints)
+    label = "Edge-case TODOs"
+    if fallback_used:
+        label += " [offline fallback]"
+    print(f"{label} written to {project_dir / 'tests' / 'test_edge_hints.py'}")
+    return 0
+
+
 def handle_menu(_: argparse.Namespace) -> int:
     """
-    Simple interactive menu for common tasks.
+    Interactive menu for common tasks (Rich UI).
     """
-    options = [
-        ("Start a kata (auto idea)", "start_auto"),
-        ("Get ideas only", "idea"),
-        ("Log progress", "log"),
-        ("Show a brief", "brief"),
-        ("Show info", "info"),
-        ("Exit", "exit"),
+    console.clear()
+    
+    kata_root = Path(DEFAULT_KATA_ROOT)
+    notes_root = Path(DEFAULT_NOTES_ROOT)
+    notes_root.mkdir(parents=True, exist_ok=True) # Ensure notes dir exists
+    
+    # --- Onboarding Check ---
+    # If skills.json doesn't exist, we assume this is a new user (or reset).
+    if not (notes_root / "skills.json").exists():
+        return run_onboarding(notes_root)
+
+    # Gather context
+    recent = latest_activity(kata_root, notes_root)
+    # Load XP
+    skills = load_skills(notes_root)
+    # Load Settings for Name
+    settings = load_settings(notes_root)
+    user_name = settings.get("user_name", "Engineer")
+    
+    # Format Skills for Dashboard
+    skill_summary = []
+    for pillar, xp in skills.items():
+        if pillar == "mixed": continue
+        title, progress = get_level_info(xp)
+        skill_summary.append(f"{pillar.title()}: [bold]{title}[/bold] ({progress})")
+    
+    # Find weakest pillar by XP (excluding 0 if others exist, or just min)
+    # Filter mixed
+    valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
+    weakest_pillar = min(valid_skills, key=valid_skills.get) if valid_skills else "python"
+    
+    project = recent[0] if recent else None
+    hints_used = count_hints_today(notes_root)
+    
+    # --- Dashboard Header ---
+    dashboard_text = (
+        f"[bold gold1]Welcome back, {user_name}.[/bold gold1]\n\n"
+        f"[bold]Skill Profile:[/bold]\n" + "\n".join(f"• {s}" for s in skill_summary) + "\n\n"
+        f"[bold]Focus:[/bold] {weakest_pillar.title()} (Weakest)\n"
+        f"[bold]Hints Used Today:[/bold] {hints_used}"
+    )
+    
+    panel = Panel(
+        dashboard_text,
+        title="[bold white]NEXUS DOJO[/bold white]",
+        subtitle="[italic grey62]Mastery through repetition[/italic grey62]",
+        border_style="blue",
+        box=box.ROUNDED,
+        padding=(1, 2)
+    )
+    console.print(panel)
+    console.print()
+
+    # --- Menu Options ---
+    # We map display labels to internal action slugs
+    menu_options = [
+        (f"⚡ Quick Train ({weakest_pillar.title()})", "quick_train"),
+        ("🚀 Start New Session", "start_auto"),
+        ("▶️  Resume Last Kata", "continue"),
+        ("✅ Sensei Check (Run Tests)", "check"),
+        ("👀 Sensei Watch Mode", "watch"),
+        ("💡 Get Unstuck (Hint)", "hint"),
+        ("🛠️  Repair Workspace", "scaffold_refresh"),
+        ("📊 My Profile & Settings", "info"),
+        ("❓ Help & Workflow", "help"),
+        ("🚪 Exit", "exit"),
     ]
-    print("NexusDojo menu:")
-    for idx, (label, _) in enumerate(options, start=1):
-        print(f"{idx}) {label}")
-    choice = input("Select an option: ").strip()
+
+    for idx, (label, _) in enumerate(menu_options, start=1):
+        console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
+    
+    console.print()
+    console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
+    
+    choice = input().strip()
+    
+    # Map input to action
     try:
         idx = int(choice)
+        if 1 <= idx <= len(menu_options):
+            action = menu_options[idx - 1][1]
+        else:
+            console.print("[red]Invalid selection.[/red]")
+            return 1
     except ValueError:
-        print("Invalid choice.")
         return 1
-    if idx < 1 or idx > len(options):
-        print("Invalid choice.")
-        return 1
-    action = options[idx - 1][1]
+
+    # --- Dispatcher ---
     if action == "exit":
+        console.print(f"[blue]See you next time, {user_name}.[/blue]")
         return 0
+        
     if action == "info":
-        return handle_info(argparse.Namespace())
-    if action == "idea":
-        return handle_idea(
+        return handle_info(argparse.Namespace(notes_root=str(DEFAULT_NOTES_ROOT)))
+
+    if action == "help":
+        return handle_help(argparse.Namespace())
+
+    if action == "check":
+        return handle_check(argparse.Namespace(
+            project=None,
+            root=str(DEFAULT_KATA_ROOT),
+            notes_root=str(DEFAULT_NOTES_ROOT)
+        ))
+
+    if action == "watch":
+        return handle_watch(argparse.Namespace(
+            project=None,
+            root=str(DEFAULT_KATA_ROOT),
+            notes_root=str(DEFAULT_NOTES_ROOT)
+        ))
+        
+    if action == "dashboard": # Keep hidden access if needed, or route via Profile
+        return handle_dashboard(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+        
+    if action == "continue":
+        return handle_continue(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+
+    if action == "quick_train":
+        # The Magic Button Logic
+        # weakest_pillar is already calculated above
+        
+        current_xp = skills.get(weakest_pillar, 0)
+        level_title, _ = get_level_info(current_xp)
+        
+        # Adaptive difficulty: If they are Novice, give Foundation. If Apprentice/Journeyman, give Proficient.
+        # If Expert/Master, give Stretch.
+        if level_title == "Novice":
+            difficulty = "foundation"
+        elif level_title in ["Apprentice", "Journeyman"]:
+            difficulty = "proficient"
+        else:
+            difficulty = "stretch"
+
+        # Adaptive mode: If API/Mixed, lean towards API template. If Python/CLI, script.
+        target_mode = "fastapi" if weakest_pillar == "api" else "script"
+
+        with console.status(f"[bold green]Analysing stats... Weakest: {weakest_pillar.upper()} ({level_title}). Generating {difficulty} drill...[/bold green]", spinner="dots"):
+            idea, used_fallback = pick_idea_with_hints(
+                provider=DEFAULT_IDEA_PROVIDER,
+                model=DEFAULT_IDEA_MODEL,
+                kata_root=Path(DEFAULT_KATA_ROOT),
+                notes_root=Path(DEFAULT_NOTES_ROOT),
+                pillar_hint=weakest_pillar,
+                level_hint=difficulty,
+                mode_hint=target_mode,
+                offline=False,
+            )
+        
+        if not idea:
+            console.print("[red]Could not generate an idea.[/red]")
+            return 1
+
+        console.print(Panel(f"[bold]{idea}[/bold]", title=f"⚡ Quick Train: {weakest_pillar.title()} ({difficulty})", border_style="yellow"))
+        
+        console.print("[dim]Launching in 3 seconds... (Ctrl+C to cancel)[/dim]")
+        import time
+        try:
+            time.sleep(3)
+        except KeyboardInterrupt:
+            return 0
+
+        return handle_start(
             argparse.Namespace(
+                idea=idea,
+                template="fastapi" if target_mode == "fastapi" else "script",
+                root=str(DEFAULT_KATA_ROOT),
+                notes_root=str(DEFAULT_NOTES_ROOT),
+                force=False,
+                pillar=weakest_pillar,
+                mode=target_mode,
+                level=difficulty,
+                tests="edge",
+                guided=False,
+                reuse_settings=False,
+                yes=True, # Auto-confirm
+                scaffold="auto",
+                offline=False,
+            )
+        )
+        
+    if action == "hint":
+        project = Prompt.ask("Kata slug")
+        question = Prompt.ask("Question focus (optional)")
+        return handle_hint(
+            argparse.Namespace(
+                project=project,
+                question=question,
                 provider=DEFAULT_IDEA_PROVIDER,
                 model=DEFAULT_IDEA_MODEL,
                 root=str(DEFAULT_KATA_ROOT),
                 notes_root=str(DEFAULT_NOTES_ROOT),
                 dry_run=False,
+                offline=False,
             )
         )
-    if action == "brief":
-        return handle_brief(
-            argparse.Namespace(
-                since=None,
-                root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT),
-            )
-        )
-    if action == "log":
-        project = input("Kata slug: ").strip()
-        note = input("Note: ").strip()
-        return handle_log(
-            argparse.Namespace(
-                project=project,
-                note=note,
-                root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT),
-            )
-        )
+        
+    if action == "scaffold_refresh":
+        project = Prompt.ask("Kata slug")
+        if not project:
+            return 1
+        return handle_scaffold_refresh(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
+        
     if action == "start_auto":
-        pillar = input("Focus pillar (python/cli/api/testing/mixed) [mixed]: ").strip().lower() or "mixed"
-        if pillar not in {"python", "cli", "api", "testing", "mixed"}:
-            pillar = "mixed"
-        mode = input("Mode/template (script/api) [script]: ").strip().lower() or "script"
-        if mode not in {"script", "api"}:
-            mode = "script"
+        pillar = Prompt.ask("Focus pillar", choices=["python", "cli", "api", "testing", "mixed"], default="mixed")
+        mode = Prompt.ask("Mode", choices=["script", "api"], default="script")
         template = "fastapi" if mode == "api" else "script"
-        level = input("Difficulty (foundation/proficient/stretch) [foundation]: ").strip().lower() or "foundation"
-        if level not in {"foundation", "proficient", "stretch"}:
-            level = "foundation"
+        level = Prompt.ask("Difficulty", choices=["foundation", "proficient", "stretch"], default="foundation")
 
-        idea = pick_idea_with_hints(
-            provider=DEFAULT_IDEA_PROVIDER,
-            model=DEFAULT_IDEA_MODEL,
-            kata_root=Path(DEFAULT_KATA_ROOT),
-            notes_root=Path(DEFAULT_NOTES_ROOT),
-            pillar_hint=pillar,
-            level_hint=level,
-            mode_hint=mode,
-        )
+        with console.status("[bold green]Generating challenge idea...[/bold green]", spinner="dots"):
+            idea, used_fallback = pick_idea_with_hints(
+                provider=DEFAULT_IDEA_PROVIDER,
+                model=DEFAULT_IDEA_MODEL,
+                kata_root=Path(DEFAULT_KATA_ROOT),
+                notes_root=Path(DEFAULT_NOTES_ROOT),
+                pillar_hint=pillar,
+                level_hint=level,
+                mode_hint=mode,
+                offline=False,
+            )
+            
         if not idea:
-            print("Could not generate an idea. Try again.")
+            console.print("[red]Could not generate an idea.[/red]")
             return 1
 
-        print("\nProposed kata:")
-        print(f"- Focus: {pillar} | Mode: {mode} ({template}) | Level: {level}")
-        print(f"- Idea: {idea}")
-        confirm = input("Create this kata? (y/n): ").strip().lower()
-        if confirm != "y":
-            print("Canceled.")
+        console.print(Panel(f"[bold]{idea}[/bold]", title="Proposed Kata", border_style="green"))
+        
+        if not Confirm.ask("Create this kata?", default=True):
+            console.print("Cancelled.")
             return 0
 
         return handle_start(
@@ -610,8 +1938,18 @@ def handle_menu(_: argparse.Namespace) -> int:
                 root=str(DEFAULT_KATA_ROOT),
                 notes_root=str(DEFAULT_NOTES_ROOT),
                 force=False,
+                pillar=pillar,
+                mode=mode,
+                level=level,
+                tests="edge",
+                guided=False,
+                reuse_settings=False,
+                yes=True,
+                scaffold="auto",
+                offline=False,
             )
         )
+        
     return 0
 
 
@@ -636,16 +1974,28 @@ def handle_idea(args: argparse.Namespace) -> int:
         print(messages[1]["content"])
         return 0
 
-    idea = call_idea_api(
+    idea_content = call_idea_api(
         provider=args.provider,
         model=args.model,
         messages=messages,
     )
+    idea = parse_idea_content(idea_content) if idea_content else None
+    used_fallback = False
+    if not idea:
+        idea = fallback_idea(
+            pillar_hint=getattr(args, "pillar", None),
+            level_hint=getattr(args, "level", None),
+            mode_hint=getattr(args, "mode", None),
+        )
+        used_fallback = bool(idea)
     if not idea:
         print("Idea generation failed. Check your API key and network.", file=sys.stderr)
         return 1
+    idea = normalize_idea_line(idea)
 
     print(f"Weakest pillar (from calibrations): {weakest or 'unknown'}")
+    if used_fallback:
+        print("Model unavailable; showing curated fallback.")
     print("Suggested ideas:")
     print(idea)
     return 0
@@ -657,6 +2007,44 @@ def append_line(path: Path, line: str) -> None:
     """
     with path.open("a", encoding="utf-8") as handle:
         handle.write(line)
+
+
+def load_settings(notes_root: Path) -> dict[str, str]:
+    """
+    Load persisted guided start settings.
+    """
+    settings_path = notes_root / "dojo_settings.json"
+    if not settings_path.exists():
+        return {}
+    try:
+        return json.loads(settings_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_settings(notes_root: Path, settings: dict[str, str]) -> None:
+    """
+    Persist guided start settings.
+    """
+    settings_path = notes_root / "dojo_settings.json"
+    settings_path.write_text(json.dumps(settings, indent=2))
+
+
+def prompt_choice(prompt: str, default: str, allowed: set[str]) -> str:
+    """
+    Prompt the user for a choice with validation and an explicit default.
+    """
+    allowed_lower = {item.lower() for item in allowed}
+    while True:
+        choice = input(prompt).strip().lower()
+        if not choice:
+            return default.lower()
+        if choice in allowed_lower:
+            return choice
+        print(
+            f"Invalid choice. Pick one of: {', '.join(sorted(allowed_lower))}. "
+            f"Default is {default}; press Enter to accept it."
+        )
 
 
 def collect_entries(kata_root: Path, notes_root: Path, since: datetime) -> list[tuple[str, str, str]]:
@@ -711,10 +2099,17 @@ def build_idea_prompt(
     katas = list_katas(kata_root)
     katas_text = ", ".join(katas) if katas else "none"
 
+    fallback_line = fallback_idea(
+        pillar_hint=pillar_hint,
+        level_hint=level_hint,
+        mode_hint=mode_hint,
+    ) or "IDEA: Unit converter -- CLI to convert units with input validation."
+
     system = (
         "You are the NexusDojo idea picker. Return ONE idea only in this exact format:\n"
         "IDEA: <short title> -- <1 sentence spec>\n"
-        "Keep it runnable in under a few hours. No prefacing text. No extra bullets."
+        "Keep it runnable in under a few hours. No prefacing text. No extra bullets.\n"
+        f"If you cannot generate from context, emit this fallback verbatim: {strip_idea_prefix(fallback_line)}"
     )
     user = (
         f"Weakest pillar: {weakest or 'unknown'}\n"
@@ -728,6 +2123,88 @@ def build_idea_prompt(
         "Return exactly one line starting with 'IDEA:' and nothing else."
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}], weakest
+
+
+def build_idea_prompt_multi(
+    kata_root: Path,
+    notes_root: Path,
+    pillar_hint: Optional[str],
+    level_hint: Optional[str],
+    mode_hint: Optional[str],
+    max_options: int,
+) -> tuple[list[dict[str, str]], Optional[str]]:
+    """
+    Build messages that request a short list of kata ideas.
+    """
+    messages, weakest = build_idea_prompt(
+        kata_root=kata_root,
+        notes_root=notes_root,
+        pillar_hint=pillar_hint,
+        level_hint=level_hint,
+        mode_hint=mode_hint,
+    )
+    system = (
+        "You are the NexusDojo idea picker. Return up to "
+        f"{max_options} ideas as bullet lines. Each line MUST start with "
+        "'IDEA:' then a short title, then '--' then a one-sentence spec. "
+        "No intro or outro text."
+    )
+    user_lines = [line for line in messages[1]["content"].splitlines() if not line.startswith("Return")]
+    user_lines.append(
+        f"Return up to {max_options} lines, each starting with 'IDEA:' and containing a one-sentence spec."
+    )
+    messages[0]["content"] = system
+    messages[1]["content"] = "\n".join(user_lines)
+    return messages, weakest
+
+
+def build_hint_prompt(project_dir: Path, notes_root: Path, question: str) -> list[dict[str, str]]:
+    """
+    Build messages for the hint generator with local context.
+    """
+    readme = (project_dir / "README.md").read_text() if (project_dir / "README.md").exists() else ""
+    recent_log = last_lines(project_dir / "LOG.md", 5) if (project_dir / "LOG.md").exists() else "No project log yet."
+    central_log = last_lines(notes_root / "log.md", 5) if (notes_root / "log.md").exists() else ""
+    calib = parse_calibrations(notes_root / "calibrations.md") if (notes_root / "calibrations.md").exists() else {}
+    weakest = weakest_pillar(calib)
+
+    system = (
+        "You are the NexusDojo mentor. Return a concise hint only. Keep it high-signal, no fluff.\n"
+        "- Format: up to 3 bullets, max 80 chars each.\n"
+        "- Prefer: next action, quick check, and 1 edge-case to test.\n"
+        "- Avoid: full solutions; be specific and terse."
+    )
+    user = (
+        f"Project: {project_dir.name}\n"
+        f"Weakest pillar: {weakest or 'unknown'}\n"
+        f"Question: {question or 'What should I do next?'}\n"
+        f"README snippet:\n{readme[:800]}\n"
+        f"Recent project log:\n{recent_log}\n"
+        f"Recent central log:\n{central_log}\n"
+        "Respond with bullets only."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_test_hint_prompt(project_dir: Path, notes_root: Path, max_hints: int) -> list[dict[str, str]]:
+    """
+    Build messages for generating edge-case test hints.
+    """
+    readme = (project_dir / "README.md").read_text() if (project_dir / "README.md").exists() else ""
+    recent_log = last_lines(project_dir / "LOG.md", 5) if (project_dir / "LOG.md").exists() else "No project log yet."
+    system = (
+        "You are the NexusDojo test coach. Propose edge cases to test.\n"
+        f"- Return a bullet list (one line each), max {max_hints} items.\n"
+        "- Focus on failure modes, boundary values, and validation paths.\n"
+        "- No implementation, only descriptions."
+    )
+    user = (
+        f"Project: {project_dir.name}\n"
+        f"README snippet:\n{readme[:800]}\n"
+        f"Recent project log:\n{recent_log}\n"
+        "List only edge cases to test."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def call_idea_api(provider: str, model: str, messages: list[dict[str, str]]) -> Optional[str]:
@@ -868,10 +2345,13 @@ def pick_idea_with_hints(
     pillar_hint: Optional[str],
     level_hint: Optional[str],
     mode_hint: Optional[str],
-) -> Optional[str]:
+    offline: bool = False,
+) -> tuple[Optional[str], bool]:
     """
     Generate an idea using hints; fall back to canned ideas if needed.
     """
+    if offline:
+        return fallback_idea(pillar_hint=pillar_hint, level_hint=level_hint, mode_hint=mode_hint), True
     messages, _ = build_idea_prompt(
         kata_root=kata_root,
         notes_root=notes_root,
@@ -882,8 +2362,49 @@ def pick_idea_with_hints(
     content = call_idea_api(provider=provider, model=model, messages=messages)
     idea = parse_idea_content(content) if content else None
     if idea:
-        return idea
-    return fallback_idea(pillar_hint=pillar_hint, level_hint=level_hint, mode_hint=mode_hint)
+        return idea, False
+    return fallback_idea(pillar_hint=pillar_hint, level_hint=level_hint, mode_hint=mode_hint), True
+
+
+def pick_idea_options(
+    provider: str,
+    model: str,
+    kata_root: Path,
+    notes_root: Path,
+    pillar_hint: Optional[str],
+    level_hint: Optional[str],
+    mode_hint: Optional[str],
+    max_options: int = 3,
+    offline: bool = False,
+) -> tuple[list[str], bool]:
+    """
+    Generate a short list of ideas; fall back to curated options.
+    """
+    if offline:
+        return fallback_idea_options(
+            pillar_hint=pillar_hint,
+            level_hint=level_hint,
+            mode_hint=mode_hint,
+            max_options=max_options,
+        ), True
+    messages, _ = build_idea_prompt_multi(
+        kata_root=kata_root,
+        notes_root=notes_root,
+        pillar_hint=pillar_hint,
+        level_hint=level_hint,
+        mode_hint=mode_hint,
+        max_options=max_options,
+    )
+    content = call_idea_api(provider=provider, model=model, messages=messages)
+    options = parse_idea_options(content, max_options) if content else []
+    if options:
+        return options[:max_options], False
+    return fallback_idea_options(
+        pillar_hint=pillar_hint,
+        level_hint=level_hint,
+        mode_hint=mode_hint,
+        max_options=max_options,
+    ), True
 
 
 def parse_idea_content(content: Optional[str]) -> Optional[str]:
@@ -897,12 +2418,33 @@ def parse_idea_content(content: Optional[str]) -> Optional[str]:
         if not cleaned:
             continue
         if cleaned.lower().startswith("idea:"):
-            return cleaned.replace("IDEA:", "", 1).strip()
+            return normalize_idea_line(cleaned)
         if cleaned.startswith(("-", "*", "•")):
             cleaned = cleaned.lstrip("-*• ").strip()
         if cleaned:
-            return cleaned
+            return normalize_idea_line(cleaned)
     return None
+
+
+def parse_idea_options(content: Optional[str], max_options: int) -> list[str]:
+    """
+    Extract multiple idea lines from model output.
+    """
+    if not content:
+        return []
+    options: list[str] = []
+    for line in parse_bullet_list(content):
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        options.append(normalize_idea_line(cleaned))
+        if len(options) >= max_options:
+            break
+    if not options:
+        solo = parse_idea_content(content)
+        if solo:
+            options.append(normalize_idea_line(solo))
+    return options
 
 
 def fallback_idea(
@@ -941,6 +2483,74 @@ def fallback_idea(
     return idea
 
 
+def fallback_idea_options(
+    pillar_hint: Optional[str],
+    level_hint: Optional[str],
+    mode_hint: Optional[str],
+    max_options: int,
+) -> list[str]:
+    """
+    Provide a small set of deterministic idea options.
+    """
+    choices: list[str] = []
+    attempts = [
+        (pillar_hint, level_hint, mode_hint),
+        (pillar_hint, "foundation", mode_hint),
+        ("mixed", level_hint, mode_hint),
+        ("mixed", "foundation", mode_hint),
+        ("python", "foundation", "script"),
+    ]
+    for pillar, level, mode in attempts:
+        idea = fallback_idea(pillar_hint=pillar, level_hint=level, mode_hint=mode)
+        if idea and idea not in choices:
+            choices.append(idea)
+        if len(choices) >= max_options:
+            break
+    if not choices:
+        choices.append("IDEA: Unit converter -- CLI to convert units with validation.")
+    return choices[:max_options]
+
+
+def latest_activity(kata_root: Path, notes_root: Path) -> Optional[tuple[str, str, str]]:
+    """
+    Return the most recent activity entry across central and kata logs.
+    """
+    entries = collect_entries(kata_root, notes_root, datetime.min)
+    return entries[-1] if entries else None
+
+
+def calibration_trend(path: Path) -> dict[str, int]:
+    """
+    Compute score deltas per pillar from calibration history.
+    """
+    deltas: dict[str, list[int]] = {}
+    for line in path.read_text().splitlines():
+        if "pillar=" not in line or "score=" not in line:
+            continue
+        try:
+            parts = line.split()
+            pillar = next(p for p in parts if p.startswith("pillar=")).split("=", 1)[1]
+            score = int(next(p for p in parts if p.startswith("score=")).split("=", 1)[1])
+        except (StopIteration, ValueError):
+            continue
+        deltas.setdefault(pillar, []).append(score)
+    return {pillar: scores[-1] - scores[0] for pillar, scores in deltas.items() if len(scores) >= 2}
+
+
+def practice_balance(scores: dict[str, int]) -> str:
+    """
+    Render a compact balance string from calibration scores.
+    """
+    if not scores:
+        return ""
+    ordered = ["python", "cli", "api", "testing"]
+    parts = [f"{pillar}:{scores[pillar]}" for pillar in ordered if pillar in scores]
+    missing = [p for p in ordered if p not in scores]
+    if missing:
+        parts.append(f"missing:{','.join(missing)}")
+    return " | ".join(parts)
+
+
 def parse_log_file(path: Path, default_project: str, since: datetime) -> list[tuple[str, str, str]]:
     """
     Parse log entries of the form "- [YYYY-MM-DD HH:MM] note".
@@ -970,6 +2580,190 @@ def parse_log_file(path: Path, default_project: str, since: datetime) -> list[tu
     return parsed
 
 
+def summarize_text(text: str, limit: int = 160) -> str:
+    """
+    Lightweight summarization by truncating and condensing whitespace.
+    """
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3].rstrip() + "..."
+
+
+def fallback_hint(question: str) -> str:
+    """
+    Provide a deterministic hint when models are unavailable.
+    """
+    base = [
+        "- Run the existing tests to see failures before coding.",
+        "- Check inputs: empty, None, wrong types, and out-of-range values.",
+        "- Log one insight to LOG.md after each change to keep momentum.",
+    ]
+    if question:
+        base.insert(0, f"- Re-read your question: {summarize_text(question, 60)}")
+    return "\n".join(base[:3])
+
+
+def parse_bullet_list(content: Optional[str]) -> list[str]:
+    """
+    Parse a simple bullet list from model output.
+    """
+    if not content:
+        return []
+    hints: list[str] = []
+    for line in content.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith(("-", "*", "•")):
+            cleaned = cleaned.lstrip("-*• ").strip()
+        hints.append(cleaned)
+    return hints
+
+
+def load_hint_history(notes_root: Path) -> dict[str, list[str]]:
+    """
+    Load hint usage history.
+    """
+    log_path = notes_root / "hints_log.json"
+    if not log_path.exists():
+        return {}
+    try:
+        data = json.loads(log_path.read_text())
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def prune_hint_history(history: dict[str, list[str]], now: datetime) -> dict[str, list[str]]:
+    """
+    Remove entries older than 24h.
+    """
+    pruned: dict[str, list[str]] = {}
+    for project, timestamps in history.items():
+        filtered: list[str] = []
+        for ts in timestamps:
+            try:
+                dt = datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            if now - dt <= timedelta(days=1):
+                filtered.append(ts)
+        if filtered:
+            pruned[project] = filtered
+    return pruned
+
+
+def hint_quota_remaining(notes_root: Path, project: Optional[str]) -> int:
+    """
+    Compute remaining hints for a project in the last 24h.
+    """
+    now = datetime.now()
+    history = prune_hint_history(load_hint_history(notes_root), now)
+    count = len(history.get(project or "", []))
+    return max(0, HINT_MAX_PER_DAY - count)
+
+
+def count_hints_today(notes_root: Path) -> int:
+    """
+    Count total hints used today across all projects.
+    """
+    now = datetime.now()
+    history = prune_hint_history(load_hint_history(notes_root), now)
+    total = 0
+    for timestamps in history.values():
+        total += len(timestamps)
+    return total
+
+
+def check_hint_rate_limit(project: str, notes_root: Path) -> tuple[bool, str, int]:
+    """
+    Enforce a short debounce for hint pulls. Daily limit is effectively unlimited.
+    """
+    log_path = notes_root / "hints_log.json"
+    notes_root.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    history = prune_hint_history(load_hint_history(notes_root), now)
+    log_path.write_text(json.dumps(history, indent=2))
+    
+    project_entries = []
+    for ts in history.get(project, []):
+        try:
+            project_entries.append(datetime.fromisoformat(ts))
+        except ValueError:
+            continue
+            
+    if project_entries:
+        last_ts = max(project_entries)
+        elapsed = (now - last_ts).total_seconds()
+        if elapsed < HINT_COOLDOWN_SECONDS:
+            wait_for = int(HINT_COOLDOWN_SECONDS - elapsed)
+            return False, f"Debouncing... wait {wait_for}s.", 999
+            
+    return True, "Ready", 999
+
+
+def record_hint_use(project: str, notes_root: Path) -> None:
+    """
+    Record a hint usage timestamp for rate limiting.
+    """
+    notes_root.mkdir(parents=True, exist_ok=True)
+    log_path = notes_root / "hints_log.json"
+    now_dt = datetime.now()
+    history = prune_hint_history(load_hint_history(notes_root), now_dt)
+    now = datetime.now().isoformat(timespec="seconds")
+    history.setdefault(project, []).append(now)
+    log_path.write_text(json.dumps(history, indent=2))
+
+
+def fallback_edge_hints(project_dir: Path) -> list[str]:
+    """
+    Provide deterministic edge-case hints based on template.
+    """
+    readme_text = (project_dir / "README.md").read_text() if (project_dir / "README.md").exists() else ""
+    template = "fastapi" if "Template: fastapi" in readme_text else "script"
+    if template == "fastapi":
+        return [
+            "Missing/empty query params for echo endpoint",
+            "Non-JSON request body and error handling",
+            "Invalid UTF-8 input and response encoding",
+            "Large payload handling or timeouts",
+        ]
+    return [
+        "Empty or whitespace-only input",
+        "Non-numeric or malformed arguments",
+        "File-not-found paths and permission errors",
+        "Upper/lower bounds and overflow/underflow",
+    ]
+
+
+def write_edge_hint_tests(project_dir: Path, hints: list[str]) -> None:
+    """
+    Materialize edge-case hints as skipped tests for fast activation.
+    """
+    tests_dir = project_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+    target = tests_dir / "test_edge_hints.py"
+    lines = [
+        '"""Auto-generated edge-case TODOs. Safe to edit."""',
+        "import unittest",
+        "",
+        "class EdgeHintTests(unittest.TestCase):",
+    ]
+    for idx, hint in enumerate(hints, start=1):
+        safe_hint = summarize_text(hint, 80).replace("'", "\"")
+        lines.extend(
+            [
+                f"    @unittest.skip('Edge hint: {safe_hint}')",
+                f"    def test_hint_{idx}(self) -> None:",
+                "        self.fail('Implement this edge case')",
+                "",
+            ]
+        )
+    target.write_text("\n".join(lines), encoding="utf-8")
+
+
 def apply_placeholders(path: Path, replacements: dict[str, str]) -> None:
     """
     Replace {{KEY}} placeholders in a text file with provided values.
@@ -984,8 +2778,604 @@ def slugify(text: str) -> str:
     """
     Convert free text to a filesystem-safe slug.
     """
+    if "--" in text:
+        text = text.split("--", 1)[0]
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug
+
+
+def next_available_slug(base_slug: str, kata_root: Path) -> str:
+    """
+    Find the next available slug by appending an incrementing suffix.
+    """
+    candidate = base_slug
+    suffix = 2
+    while (kata_root / candidate).exists():
+        candidate = f"{base_slug}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def apply_placeholders_tree(root: Path, replacements: dict[str, str]) -> None:
+    """
+    Apply placeholder replacements to all text files under a root directory.
+    """
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name.startswith(".") or path.suffix in {".pyc"}:
+            continue
+        try:
+            content = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        updated = content
+        for key, value in replacements.items():
+            updated = updated.replace(f"{{{{{key}}}}}", value)
+        if updated != content:
+            path.write_text(updated)
+
+
+def resolve_template(template: str, mode_hint: Optional[str]) -> str:
+    """
+    Normalize the template choice from CLI and mode hints.
+    """
+    if mode_hint == "api":
+        return "fastapi"
+    return template
+
+
+def normalize_idea_line(content: str) -> str:
+    """
+    Normalize an idea to a single 'IDEA: title -- spec' line.
+    """
+    cleaned = (content or "").strip()
+    if not cleaned:
+        cleaned = "Untitled kata"
+    if cleaned.lower().startswith("idea:"):
+        cleaned = cleaned.split(":", 1)[1].strip()
+    if "--" not in cleaned:
+        cleaned = cleaned.replace("  ", " ")
+        cleaned = f"{cleaned} -- crisp spec"
+    normalized = cleaned if cleaned.lower().startswith("idea:") else f"IDEA: {cleaned}"
+    return normalized.strip()
+
+
+def strip_idea_prefix(content: str) -> str:
+    """
+    Remove the leading IDEA: label if present.
+    """
+    cleaned = (content or "").strip()
+    if cleaned.lower().startswith("idea:"):
+        return cleaned.split(":", 1)[1].strip()
+    return cleaned
+
+
+def generate_scaffold_spec(
+    idea_line: str,
+    pillar_hint: Optional[str],
+    level_hint: Optional[str],
+    template: str,
+    offline: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Generate a scaffold spec using the default idea provider with safe fallback.
+    """
+    if offline:
+        return fallback_scaffold_spec(idea_line, template=template), True
+    messages = build_scaffold_prompt(
+        idea_line=idea_line,
+        pillar_hint=pillar_hint,
+        level_hint=level_hint,
+        template=template,
+    )
+    content = call_idea_api(
+        provider=DEFAULT_IDEA_PROVIDER,
+        model=DEFAULT_IDEA_MODEL,
+        messages=messages,
+    )
+    spec = parse_scaffold_spec(content) if content else None
+    fallback_used = False
+    if not spec:
+        spec = fallback_scaffold_spec(idea_line)
+        fallback_used = True
+    return spec, fallback_used
+
+
+def build_scaffold_prompt(
+    idea_line: str,
+    pillar_hint: Optional[str],
+    level_hint: Optional[str],
+    template: str,
+) -> list[dict[str, str]]:
+    """
+    Ask the model for a structured kata scaffold (JSON only).
+    """
+    idea_title = strip_idea_prefix(idea_line)
+    system = (
+        "You are the NexusDojo scaffold builder. Return ONLY a JSON object with keys:\n"
+        "- title (string), summary (string), idea (string)\n"
+        "- functions: list of objects {name, signature, description, example, edge_cases}\n"
+        "- example: {args: list, kwargs: object, output: JSON-serializable}\n"
+        "Keep examples small and deterministic. No code fences, no prose, JSON only."
+    )
+    user = (
+        f"Idea: {idea_title}\n"
+        f"Pillar hint: {pillar_hint or 'mixed'}\n"
+        f"Level hint: {level_hint or 'foundation'}\n"
+        f"Template: {template}\n"
+        "Return JSON only."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def parse_scaffold_spec(content: Optional[str]) -> Optional[dict[str, Any]]:
+    """
+    Parse scaffold JSON from model output.
+    """
+    if not content:
+        return None
+    text = content.strip()
+    if "{" in text and "}" in text:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start : end + 1]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    functions = []
+    for fn in data.get("functions", []) or []:
+        if isinstance(fn, dict) and fn.get("name"):
+            functions.append(fn)
+    data["functions"] = functions
+    return data
+
+
+def fallback_scaffold_spec(idea_line: str, template: str) -> dict[str, Any]:
+    """
+    Deterministic scaffold packs for offline use (script + fastapi).
+    """
+    title = strip_idea_prefix(idea_line) or "Kata"
+    packs = {
+        "script": [
+            {
+                "title": "String cleanup + counts",
+                "summary": "Practice cleaning strings, counting frequencies, and safe arithmetic with tests.",
+                "functions": [
+                    {
+                        "name": "clean_names",
+                        "signature": "def clean_names(names: list[str]) -> list[str]",
+                        "description": "Trim whitespace, lowercase names, and drop empty values.",
+                        "example": {"args": [[" Alice ", "", "BOB"]], "kwargs": {}, "output": ["alice", "bob"]},
+                        "edge_cases": ["None or non-iterable input", "Whitespace-only entries", "Mixed casing"],
+                    },
+                    {
+                        "name": "top_counts",
+                        "signature": "def top_counts(items: list[str], n: int) -> list[tuple[str, int]]",
+                        "description": "Count occurrences and return the top n as (item, count) sorted by count then name.",
+                        "example": {"args": [["a", "b", "a", "c", "b", "a"], 2], "kwargs": {}, "output": [["a", 3], ["b", 2]]},
+                        "edge_cases": ["n <= 0", "Empty input list", "Ties on count"],
+                    },
+                    {
+                        "name": "safe_divide",
+                        "signature": "def safe_divide(a: float, b: float, default=None)",
+                        "description": "Divide a by b, returning default on zero division or type errors.",
+                        "example": {"args": [10, 2], "kwargs": {"default": None}, "output": 5.0},
+                        "edge_cases": ["Zero division", "Non-numeric inputs", "Custom default values"],
+                    },
+                ],
+                "cli": {
+                    "description": "Read newline-delimited names from a file and print top 3 counts as JSON.",
+                    "example_usage": "python main.py --path names.txt",
+                },
+            },
+            {
+                "title": "Mini temperature stats",
+                "summary": "Compute min/avg/max temperatures from a list and handle bad inputs cleanly.",
+                "functions": [
+                    {
+                        "name": "parse_temps",
+                        "signature": "def parse_temps(raw: list[str]) -> list[float]",
+                        "description": "Parse a list of strings into floats, ignoring blanks and invalid tokens.",
+                        "example": {"args": [["72.5", "bad", " 68 "]], "kwargs": {}, "output": [72.5, 68.0]},
+                        "edge_cases": ["Empty list", "Non-numeric tokens", "Leading/trailing spaces"],
+                    },
+                    {
+                        "name": "summarize_temps",
+                        "signature": "def summarize_temps(temps: list[float]) -> dict[str, float]",
+                        "description": "Return min, max, and average temperatures rounded to 2 decimals.",
+                        "example": {"args": [[72.5, 68.0]], "kwargs": {}, "output": {"min": 68.0, "max": 72.5, "avg": 70.25}},
+                        "edge_cases": ["Empty list raises ValueError", "Single element list"],
+                    },
+                    {
+                        "name": "format_report",
+                        "signature": "def format_report(summary: dict[str, float]) -> str",
+                        "description": "Render a human-readable report line from a summary dict.",
+                        "example": {"args": [{"min": 68.0, "max": 72.5, "avg": 70.25}], "kwargs": {}, "output": "Min 68.00, Max 72.50, Avg 70.25"},
+                        "edge_cases": ["Missing keys", "Non-numeric values"],
+                    },
+                ],
+                "cli": {
+                    "description": "Read temperatures from stdin and print summary.",
+                    "example_usage": "echo '72\\n70\\n71' | python main.py",
+                },
+            },
+        ],
+        "fastapi": [
+            {
+                "title": "Echo + stats API",
+                "summary": "Expose /health, /echo, and /stats endpoints with validation.",
+                "routes": [
+                    {
+                        "path": "/health",
+                        "method": "get",
+                        "summary": "Readiness check returning status ok.",
+                        "response_example": {"status": "ok"},
+                    },
+                    {
+                        "path": "/echo",
+                        "method": "get",
+                        "summary": "Echo a query parameter 'message'.",
+                        "query_params": {"message": "hi"},
+                        "response_example": {"echo": "hi"},
+                    },
+                    {
+                        "path": "/stats",
+                        "method": "post",
+                        "summary": "Accept list of numbers and return min/max/avg.",
+                        "body_example": {"values": [1, 2, 3]},
+                        "response_example": {"min": 1, "max": 3, "avg": 2.0},
+                    },
+                ],
+            }
+        ],
+    }
+    chosen_pack = packs.get(template) or packs["script"]
+    idx = sum(ord(c) for c in title) % len(chosen_pack)
+    pack = chosen_pack[idx]
+    pack = dict(pack)
+    pack.setdefault("title", title)
+    pack["idea"] = idea_line
+    pack["summary"] = pack.get("summary") or "Implement the endpoints/functions and make the tests pass."
+    return pack
+
+
+def apply_kata_scaffold(
+    target_dir: Path,
+    spec: dict[str, Any],
+    template: str,
+    overwrite_existing: bool = True,
+) -> None:
+    """
+    Materialize kata.md, stubs, and tests from a scaffold spec.
+    """
+    tests_dir = target_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "__init__.py").write_text("", encoding="utf-8")
+
+    idea_title = spec.get("title") or "Kata"
+    summary = spec.get("summary") or "Implement the functions and make the tests pass."
+    functions = spec.get("functions") or []
+    routes = spec.get("routes") or []
+    if not functions and template == "script":
+        functions = fallback_scaffold_spec(spec.get("idea", idea_title), template="script").get("functions", [])
+    if not routes and template == "fastapi":
+        routes = fallback_scaffold_spec(spec.get("idea", idea_title), template="fastapi").get("routes", [])
+
+    kata_md = target_dir / "kata.md"
+    md_lines = [
+        f"# {idea_title}",
+        "",
+        summary,
+        "",
+        "## Functions to implement",
+    ]
+    if template == "script":
+        for fn in functions:
+            md_lines.append(f"- {fn.get('name', 'function')}: {fn.get('description', 'Describe the behavior.')}")
+            example = fn.get("example") or {}
+            if example:
+                md_lines.append(f"  - Example args: {example.get('args', [])}, kwargs: {example.get('kwargs', {})}, output: {example.get('output')}")
+            edge = fn.get("edge_cases") or []
+            if edge:
+                md_lines.append(f"  - Edge cases: {', '.join(edge)}")
+    else:
+        md_lines.append("Implement the FastAPI routes below:")
+        for route in routes:
+            md_lines.append(f"- {route.get('method', 'get').upper()} {route.get('path')}: {route.get('summary', '')}")
+            if route.get("response_example"):
+                md_lines.append(f"  - Response example: {route['response_example']}")
+            if route.get("query_params"):
+                md_lines.append(f"  - Query params: {route['query_params']}")
+            if route.get("body_example"):
+                md_lines.append(f"  - Body example: {route['body_example']}")
+    md_lines.extend(
+        [
+            "",
+            "## Quickstart",
+        ]
+    )
+    if template == "script":
+        md_lines.extend(
+            [
+                "- Run tests: python -m unittest",
+                "- Run script: python main.py",
+            ]
+        )
+    else:
+        md_lines.extend(
+            [
+                "- Run tests: python -m unittest",
+                "- Start API: uvicorn main:app --reload",
+                "- Hit health: curl http://127.0.0.1:8000/health",
+            ]
+        )
+        md_lines.append("- Start with tests, then fill in stubs.")
+    if overwrite_existing or not kata_md.exists():
+        kata_md.write_text("\n".join(md_lines), encoding="utf-8")
+
+    main_py = target_dir / "main.py"
+    tests_path = tests_dir / "test_main.py"
+    if template == "script":
+        main_lines = [
+            '"""Auto-generated scaffold stubs. Replace with your implementation."""',
+            "",
+            "def main() -> None:",
+            f"    print(\"{idea_title}: implement functions and run tests\")",
+            "",
+        ]
+        for fn in functions:
+            signature = (fn.get("signature") or f"def {fn.get('name', 'task')}(*args, **kwargs)").strip()
+            if not signature.startswith("def "):
+                signature = f"def {signature}"
+            if not signature.rstrip().endswith(":"):
+                signature = signature.rstrip() + ":"
+            desc = summarize_text(fn.get("description", ""), 120)
+            main_lines.append(signature)
+            if desc:
+                main_lines.append(f"    \"\"\"{desc}\"\"\"")
+            main_lines.append("    raise NotImplementedError('Implement this function')")
+            main_lines.append("")
+        if overwrite_existing or not main_py.exists():
+            main_py.write_text("\n".join(main_lines), encoding="utf-8")
+
+        fn_names = [fn.get("name", "") for fn in functions if fn.get("name")]
+        imports = ", ".join(["main"] + [name for name in fn_names if name])
+        test_lines = [
+            '"""Auto-generated tests for the scaffold. Edit as needed."""',
+            "import unittest",
+            f"from main import {imports}  # type: ignore",
+            "",
+            "class ScaffoldTests(unittest.TestCase):",
+            "    def test_main_runs(self) -> None:",
+            "        self.assertIsNone(main())",
+            "",
+        ]
+        for fn in functions:
+            name = fn.get("name")
+            if not name:
+                continue
+            example = fn.get("example") or {}
+            args = _coerce_example_value(example.get("args", []))
+            kwargs = _coerce_example_value(example.get("kwargs", {}))
+            expected = _coerce_example_value(example.get("output"))
+            test_lines.append(f"    def test_{name}_example(self) -> None:")
+            test_lines.append(f"        args = {repr(args)}")
+            test_lines.append(f"        kwargs = {repr(kwargs)}")
+            test_lines.append(f"        result = {name}(*args, **kwargs)")
+            if expected is not None:
+                test_lines.append(f"        self.assertEqual(result, {repr(expected)})")
+            else:
+                test_lines.append("        self.fail('Add an expected value for this example')")
+            test_lines.append("")
+        if overwrite_existing or not tests_path.exists():
+            tests_path.write_text("\n".join(test_lines), encoding="utf-8")
+    else:
+        main_lines = [
+            '"""Auto-generated FastAPI scaffold. Fill in route logic."""',
+            "from fastapi import FastAPI, HTTPException",
+            "from pydantic import BaseModel",
+            "",
+            f"app = FastAPI(title=\"{idea_title}\")",
+            "",
+        ]
+        needs_payload = any(route.get("body_example") for route in routes)
+        if needs_payload:
+            main_lines.append("class StatsPayload(BaseModel):")
+            main_lines.append("    values: list[float]")
+            main_lines.append("")
+        for route in routes:
+            method = route.get("method", "get").lower()
+            path = route.get("path", "/")
+            fn_name = route.get("name") or f"{method}_{path.strip('/').replace('/', '_') or 'root'}"
+            main_lines.append(f"@app.{method}(\"{path}\")")
+            signature = f"def {fn_name}("
+            params: list[str] = []
+            if route.get("query_params"):
+                for key, default in route["query_params"].items():
+                    params.append(f"{key}: str")
+            if route.get("body_example"):
+                params.append("payload: StatsPayload")
+            signature += ", ".join(params) + ") -> dict[str, object]:"
+            main_lines.append(signature)
+            desc = summarize_text(route.get("summary", ""), 120)
+            if desc:
+                main_lines.append(f"    \"\"\"{desc}\"\"\"")
+            main_lines.append("    # TODO: implement route logic")
+            main_lines.append("    raise HTTPException(status_code=501, detail=\"Not implemented\")")
+            main_lines.append("")
+        main_lines.append("")
+        main_lines.append("if __name__ == \"__main__\":")
+        main_lines.append("    import uvicorn")
+        main_lines.append("    uvicorn.run(\"main:app\", host=\"0.0.0.0\", port=8000, reload=True)")
+        if overwrite_existing or not main_py.exists():
+            main_py.write_text("\n".join(main_lines), encoding="utf-8")
+
+        test_lines = [
+            '"""Auto-generated tests for the FastAPI scaffold. Edit as needed."""',
+            "import unittest",
+            "from fastapi.testclient import TestClient",
+            "from main import app",
+            "",
+            "client = TestClient(app)",
+            "",
+            "class ScaffoldTests(unittest.TestCase):",
+            "    def test_health_exists(self) -> None:",
+            "        resp = client.get('/health')",
+            "        self.assertEqual(resp.status_code, 200)",
+            "        self.assertIsInstance(resp.json(), dict)",
+            "",
+        ]
+        for route in routes:
+            path = route.get("path", "/")
+            method = route.get("method", "get").lower()
+            response_example = route.get("response_example")
+            query_params = route.get("query_params") or {}
+            body_example = route.get("body_example")
+            test_lines.append(f"    def test_{method}_{path.strip('/').replace('/', '_') or 'root'}(self) -> None:")
+            if body_example:
+                test_lines.append(f"        payload = {repr(body_example)}")
+                test_lines.append(f"        resp = client.{method}(\"{path}\", json=payload)")
+            else:
+                params_repr = repr(query_params)
+                if method == "get":
+                    test_lines.append(f"        resp = client.get(\"{path}\", params={params_repr})")
+                else:
+                    test_lines.append(f"        resp = client.{method}(\"{path}\", params={params_repr})")
+            test_lines.append("        self.assertEqual(resp.status_code, 200)")
+            if response_example is not None:
+                test_lines.append("        self.assertEqual(resp.json(), " + repr(response_example) + ")")
+            test_lines.append("")
+        if overwrite_existing or not tests_path.exists():
+            tests_path.write_text("\n".join(test_lines), encoding="utf-8")
+
+
+def _coerce_example_value(value: Any) -> Any:
+    """
+    Try to coerce stringified examples into Python values.
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def handle_scaffold_refresh(args: argparse.Namespace) -> int:
+    """
+    Regenerate missing scaffold files without overwriting user code.
+    """
+    kata_root = Path(args.root).expanduser()
+    project_dir = kata_root / args.project
+    if not project_dir.exists():
+        print(f"Kata not found at {project_dir}", file=sys.stderr)
+        return 1
+
+    idea_title = read_kata_title(project_dir) or args.project
+    template = infer_kata_template(project_dir)
+    idea_line = f"IDEA: {idea_title} -- scaffold refresh"
+    spec = fallback_scaffold_spec(idea_line, template=template)
+    apply_kata_scaffold(
+        target_dir=project_dir,
+        spec=spec,
+        template=template,
+        overwrite_existing=False,
+    )
+    print(f"Scaffold refreshed for {args.project} (template={template}). Existing files kept.")
+    return 0
+
+
+def read_kata_title(project_dir: Path) -> str:
+    """
+    Infer kata title from README first line.
+    """
+    readme = project_dir / "README.md"
+    if not readme.exists():
+        return ""
+    first_line = readme.read_text().splitlines()
+    if not first_line:
+        return ""
+    line = first_line[0].lstrip("#").strip()
+    return line or ""
+
+
+def infer_kata_template(project_dir: Path) -> str:
+    """
+    Infer template type from README or files.
+    """
+    readme = (project_dir / "README.md").read_text() if (project_dir / "README.md").exists() else ""
+    if "Template: fastapi" in readme:
+        return "fastapi"
+    if (project_dir / "requirements.txt").exists() and "fastapi" in (project_dir / "requirements.txt").read_text().lower():
+        return "fastapi"
+    return "script"
+
+
+def print_banner() -> None:
+    """
+    Lightweight ASCII banner for menu mode.
+    """
+    art = [
+        "                                        .___         __        ",
+        "  ____   ____ ___  _____ __  ______   __| _/____    |__| ____  ",
+        " /    \\_/ __ \\\\  \\/  /  |  \\/  ___/  / __ |/  _ \\   |  |/  _ \\ ",
+        "|   |  \\  ___/ >    <|  |  /\\___ \\  / /_/ (  <_> )  |  (  <_> )",
+        "|___|  /\\___  >__/\\_ \\____//____  > \\____ |\\____/\\__|  |\\____/ ",
+        "     \\/     \\/      \\/          \\/       \\/     \\______|      ",
+    ]
+    print("\n".join(art))
+
+
+def seed_test_scaffold(target_dir: Path, template: str, idea_line: str, include_edge: bool) -> None:
+    """
+    Seed a smoke test (and optional edge-case TODOs) inside the kata.
+    """
+    tests_dir = target_dir / "tests"
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "__init__.py").write_text("")
+
+    idea_title = strip_idea_prefix(idea_line)
+    smoke_path = tests_dir / "test_smoke.py"
+    if not smoke_path.exists():
+        if template == "fastapi":
+            smoke_content = (
+                '"""Smoke tests for the generated FastAPI app."""\n'
+                "import importlib\n"
+                "from fastapi import FastAPI\n\n"
+                "def test_app_exposes_fastapi_instance() -> None:\n"
+                '    module = importlib.import_module("main")\n'
+                "    app = getattr(module, \"app\", None)\n"
+                "    assert isinstance(app, FastAPI)\n"
+            )
+        else:
+            smoke_content = (
+                '"""Smoke tests for the generated script kata."""\n'
+                "import importlib\n\n"
+                "def test_main_executes() -> None:\n"
+                '    module = importlib.import_module("main")\n'
+                "    main_fn = getattr(module, \"main\", None)\n"
+                "    if callable(main_fn):\n"
+                "        main_fn()\n"
+            )
+        smoke_path.write_text(smoke_content)
+
+    if include_edge:
+        edge_path = tests_dir / "test_edge_cases.py"
+        if not edge_path.exists():
+            edge_content = (
+                '"""Edge-case TODOs to harden the kata quickly."""\n'
+                "import unittest\n\n"
+                f"class EdgeCases(unittest.TestCase):\n"
+                f"    @unittest.skip('Fill in edge cases for {idea_title}')\n"
+                "    def test_edge_cases(self) -> None:\n"
+                "        self.assertTrue(True)\n"
+            )
+            edge_path.write_text(edge_content)
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
