@@ -16,26 +16,35 @@ NexusDojo is a local-first CLI designed to train you in **Python**, **APIs**, an
     *   `rag`: Retrieval-Augmented Generation pipelines (ChromaDB stubs).
     *   `mcp`: Micro-Capability Protocol servers for Agentic tools.
 
+## 📦 Installation
+
+### Prerequisites
+*   Python 3.10+
+*   **Ollama** (Required for AI features). Run `ollama pull qwen2.5-coder:1.5b`.
+
+### Install via Pip
+```bash
+# Clone the repository
+git clone https://github.com/YOUR_USERNAME/nexusdojo.git
+cd nexusdojo
+
+# Create a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install the CLI
+pip install -e .
+```
+
+### Configuration
+The Dojo works out of the box with local Ollama.
+Optionally, set environment variables for Cloud AI:
+```bash
+export NEXUSDOJO_PROVIDER=openrouter
+export NEXUSDOJO_API_KEY=sk-...
+```
+
 ## 📈 Progression System
-
-The Dojo tracks your growth across 4 pillars: **Python**, **CLI**, **API**, and **Testing**.
-*   **XP:** Earn XP by completing katas.
-*   **Levels:** Novice → Apprentice → Journeyman → Expert → Master.
-*   **Adaptation:** As you level up, the `Quick Train` AI will generate harder challenges to keep you in the flow state.
-
-## 🛠️ Setup
-
-1.  Create a virtual environment:
-    ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate  # Windows: .venv\Scripts\activate
-    ```
-2.  Install dependencies (including `rich` and `watchdog`):
-    ```bash
-    pip install -e .
-    ```
-
-## 🥋 The Recommended Workflow
 
 **Goal:** Frictionless training loop.
 

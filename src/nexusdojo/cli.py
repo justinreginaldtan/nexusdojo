@@ -11,6 +11,8 @@ import platform
 import re
 import shutil
 import sys
+import subprocess
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -39,7 +41,7 @@ DEFAULT_NOTES_ROOT = Path("./notes")
 TEMPLATES_ROOT = Path(__file__).resolve().parents[2] / "templates"
 # Default model settings for idea generation.
 DEFAULT_IDEA_PROVIDER = "ollama"
-DEFAULT_IDEA_MODEL = "llama3.2:1b"
+DEFAULT_IDEA_MODEL = "qwen2.5-coder:1.5b"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 # Relaxed rate limits (unlimited daily, short debounce)
@@ -533,6 +535,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch_parser.set_defaults(func=handle_watch)
 
+    play_parser = subparsers.add_parser(
+        "play",
+        help="Open a temporary playground for experimentation.",
+    )
+    play_parser.set_defaults(func=handle_play)
+
+    solve_parser = subparsers.add_parser(
+        "solve",
+        help="Generate a solution for the current kata (Zero XP).",
+    )
+    solve_parser.add_argument(
+        "project",
+        nargs="?",
+        help="Slug of the kata to solve.",
+    )
+    solve_parser.set_defaults(func=handle_solve)
+
+    reset_parser = subparsers.add_parser(
+        "reset",
+        help="Reset main.py to the initial boilerplate.",
+    )
+    reset_parser.add_argument(
+        "project",
+        nargs="?",
+        help="Slug of the kata to reset.",
+    )
+    reset_parser.set_defaults(func=handle_reset)
+
     return parser
 
 
@@ -554,6 +584,8 @@ def handle_watch(args: argparse.Namespace) -> int:
         console.print(f"[bold red]Error:[/bold red] No 'tests' folder found in {project_dir}.")
         return 1
 
+    start_time = time.time()
+
     console.print(Panel(
         f"Watching [cyan]{project_dir}[/cyan]\n"
         "Edit any .py file to trigger tests.\n"
@@ -568,10 +600,24 @@ def handle_watch(args: argparse.Namespace) -> int:
                 # Small debounce to avoid double-firing on some editors
                 time.sleep(0.1)
                 console.clear()
+                
+                elapsed = int(time.time() - start_time)
+                mins, secs = divmod(elapsed, 60)
+                timer_str = f"{mins:02}:{secs:02}"
+                
+                console.print(Panel(
+                    f"[bold]FOCUS TIMER:[/bold] [cyan]{timer_str}[/cyan]",
+                    box=box.MINIMAL,
+                    style="dim"
+                ))
+                
                 console.print(f"[dim]Change detected in {Path(event.src_path).name}...[/dim]")
                 # We call handle_check but suppress the return code to keep watching
                 try:
-                    handle_check(args)
+                    # Pass auto_log=True to avoid blocking prompts in watch mode
+                    check_args = argparse.Namespace(**vars(args))
+                    check_args.auto_log = True
+                    handle_check(check_args)
                 except Exception as e:
                     console.print(f"[red]Error running check: {e}[/red]")
 
@@ -607,6 +653,12 @@ def handle_check(args: argparse.Namespace) -> int:
         console.print(f"[bold red]Error:[/bold red] No 'tests' folder found in {project_dir}. Are you in a kata directory?")
         return 1
     
+    # Auto-install deps
+    install_dependencies(project_dir)
+    
+    # Check for auto-log flag passed via args or inferred
+    auto_log = getattr(args, "auto_log", False)
+    
     console.print(f"[bold blue]Running tests for:[/bold blue] {project_dir.name}...")
 
     # Run unittest
@@ -633,27 +685,42 @@ def handle_check(args: argparse.Namespace) -> int:
             try:
                 meta = json.loads(kata_meta_path.read_text())
                 pillar = meta.get("pillar", "mixed")
+                cheated = meta.get("cheated", False)
                 
-                console.print(f"[bold]Rate this drill ([cyan]{pillar.upper()}[/cyan]):[/bold]")
-                console.print("[1] Too Easy  (Speed +5 XP)")
-                console.print("[2] Perfect   (Growth +15 XP)")
-                console.print("[3] Too Hard  (Grit +20 XP)")
-                
-                rating = Prompt.ask("Rating", choices=["1", "2", "3"], default="2")
-                
-                xp_gain, new_level = update_skill(Path(args.notes_root), pillar, rating)
-                
-                console.print(Panel(
-                    f"XP Gained: [bold gold1]+{xp_gain}[/bold gold1]\n"
-                    f"New Level: [bold cyan]{new_level}[/bold cyan]",
-                    title="🆙 LEVEL UP",
-                    border_style="gold1"
-                ))
+                if cheated:
+                    console.print("[dim]XP forfeited (Solution Used).[/dim]")
+                elif not auto_log:
+                    console.print(f"[bold]Rate this drill ([cyan]{pillar.upper()}[/cyan]):[/bold]")
+                    console.print("[1] Too Easy  (Speed +5 XP)")
+                    console.print("[2] Perfect   (Growth +15 XP)")
+                    console.print("[3] Too Hard  (Grit +20 XP)")
+                    rating = Prompt.ask("Rating", choices=["1", "2", "3"], default="2")
+                    xp_gain, new_level = update_skill(Path(args.notes_root), pillar, rating)
+                    console.print(Panel(
+                        f"XP Gained: [bold gold1]+{xp_gain}[/bold gold1]\n"
+                        f"New Level: [bold cyan]{new_level}[/bold cyan]",
+                        title="🆙 LEVEL UP",
+                        border_style="gold1"
+                    ))
+                elif auto_log and not cheated:
+                     # In silent mode, we award standard XP (Perfect=15) silently
+                     update_skill(Path(args.notes_root), pillar, "2")
+                     
             except Exception as e:
                 console.print(f"[dim]XP update failed: {e}[/dim]")
 
-        # Auto-log prompt
-        if Confirm.ask("Log this victory?"):
+        # Auto-log logic
+        if auto_log:
+            # Silent Log
+            note = "Tests passed (Watch Mode Auto-Log)"
+            handle_log(argparse.Namespace(
+                project=project_dir.name,
+                note=note,
+                root=str(kata_root),
+                notes_root=str(args.notes_root)
+            ))
+            console.print("[dim]✔ Logged to history.[/dim]")
+        elif Confirm.ask("Log this victory?"):
             note = Prompt.ask("What did you learn/build?")
             handle_log(argparse.Namespace(
                 project=project_dir.name,
@@ -1326,9 +1393,24 @@ def handle_start(args: argparse.Namespace) -> int:
     if fallback_used_mission:
         console.print("[yellow]Note: LLM unavailable for mission spec; using curated fallback.[/yellow]", file=sys.stderr)
 
-    # Set default main.py content for new templates if needed
-    if resolved_template in {"rag", "mcp"} and not (target_dir / "main.py").read_text().strip():
-        set_default_main_py_content(target_dir, resolved_template, idea_title)
+    # Mission Injection Logic
+    docstring_mission = "\n".join([line for line in mission_md_content.splitlines() if not line.startswith("# Mission")])
+    mission_header = f'"""{idea_title}\n\nMISSION SPECS:\n{docstring_mission}\n"""\n'
+
+    if not scaffolded:
+        # Use smart boilerplate for RAG/MCP or failed scaffolds
+        set_default_main_py_content(target_dir, resolved_template, idea_title, mission_md_content)
+    else:
+        # Prepend mission to existing scaffolded main.py
+        main_py = target_dir / "main.py"
+        if main_py.exists():
+            original_content = main_py.read_text()
+            # Remove existing generic docstring if present
+            if original_content.startswith('"""Auto-generated'):
+                _, original_content = original_content.split('"""', 2)[2:]
+                original_content = original_content.lstrip()
+            
+            main_py.write_text(mission_header + original_content)
 
     # Write metadata for progression tracking
     (target_dir / ".kata.json").write_text(json.dumps({
@@ -1349,6 +1431,17 @@ def handle_start(args: argparse.Namespace) -> int:
             console.print("[yellow]Note: LLM scaffold unavailable; used deterministic fallback.[/yellow]", file=sys.stderr)
     if effective_tests_pref != "skip":
         console.print("[green]Tests seeded: Run `dojo check` to verify.[/green]")
+    
+    # --- Zero-Friction Launch ---
+    # If this was a Quick Train (yes=True) or user confirms, we launch.
+    should_launch = args.yes # Auto-launch for Quick Train
+    if not should_launch and interactive:
+        should_launch = Confirm.ask("🚀 Launch Training Environment now?", default=True)
+
+    if should_launch:
+        launch_session(target_dir)
+        return 0 # launch_session might replace process, but if not, we return success.
+
     console.print(
         "[bold blue]Next steps:[/bold blue]\n"
         f"- [bold]cd {target_dir.name}[/bold]\n"
@@ -1359,14 +1452,90 @@ def handle_start(args: argparse.Namespace) -> int:
     return 0
 
 
-def set_default_main_py_content(target_dir: Path, template: str, idea_title: str) -> None:
+def launch_session(project_dir: Path) -> None:
     """
-    Sets a default main.py content for new templates if they are empty after copy.
+    Launch the editor and watch mode. Detects tmux for split-pane glory.
+    """
+    import subprocess
+    import os
+    
+    # --- Auto-Sitrep ---
+    log_path = project_dir / "LOG.md"
+    sitrep = "No prior logs."
+    if log_path.exists():
+        lines = log_path.read_text().splitlines()
+        if lines:
+            sitrep = lines[-1] # Last line
+    
+    console.print(Panel(
+        f"[bold]Project:[/bold] {project_dir.name}\n"
+        f"[bold]Last Log:[/bold] {sitrep}",
+        title="📝 SITREP",
+        border_style="yellow"
+    ))
+    time.sleep(1.5) # Let them read it
+
+    # Check for TMUX
+    in_tmux = os.environ.get("TMUX") is not None
+    
+    if in_tmux:
+        console.print("[green]Tmux detected. Configuring split-pane environment...[/green]")
+        # 1. Split window horizontally, cd to project, run dojo watch
+        subprocess.run([
+            "tmux", "split-window", "-h", 
+            "-c", str(project_dir), 
+            f"{sys.executable} -m nexusdojo.cli watch"
+        ])
+        
+        # 2. Open nvim in the current pane
+        # We replace the current process with nvim to keep the flow clean
+        console.print("[dim]Launching Neovim...[/dim]")
+        
+        # We need to change cwd for the nvim process
+        os.chdir(project_dir)
+        
+        # Use execvp to replace the python process with nvim
+        # We open MISSION.md (read-only reference) and main.py (to edit)
+        # -O opens in vertical splits inside nvim, or just open files as buffers
+        # Let's just open main.py and MISSION.md as buffers.
+        os.execvp("nvim", ["nvim", "main.py", "MISSION.md"])
+        
+    else:
+        console.print("[yellow]Tip: Run 'dojo menu' inside tmux for auto-split 'Watch Mode'.[/yellow]")
+        console.print("[dim]Launching Neovim...[/dim]")
+        os.chdir(project_dir)
+        # Just launch nvim
+        subprocess.run(["nvim", "main.py", "MISSION.md"])
+
+
+def set_default_main_py_content(target_dir: Path, template: str, idea_title: str, mission_content: str = "") -> None:
+    """
+    Sets a default main.py content with Mission Injection and Smart Imports.
     """
     main_py_path = target_dir / "main.py"
+    
+    # Smart Imports
+    imports = []
+    if "json" in mission_content.lower(): imports.append("import json")
+    if "csv" in mission_content.lower(): imports.append("import csv")
+    if "regex" in mission_content.lower() or "pattern" in mission_content.lower(): imports.append("import re")
+    if "file" in mission_content.lower() or "path" in mission_content.lower(): imports.append("from pathlib import Path")
+    if "async" in mission_content.lower(): imports.append("import asyncio")
+    if "env" in mission_content.lower(): imports.append("import os")
+    
+    import_block = "\n".join(imports)
+    
+    # Clean mission content for docstring (remove header to save space)
+    docstring_mission = "\n".join([line for line in mission_content.splitlines() if not line.startswith("# Mission")])
+
     if template == "rag":
-        content = f'''"""RAG Kata: {idea_title}"""
+        content = f'''"""RAG Kata: {idea_title}
+
+MISSION SPECS:
+{docstring_mission}
+"""
 from typing import List, Dict
+{import_block}
 
 def retrieve_context(query: str, top_k: int = 3) -> List[str]:
     """
@@ -1391,10 +1560,15 @@ if __name__ == "__main__":
     main()
 '''
     elif template == "mcp":
-        content = f'''"""MCP Server Kata: {idea_title}"""
+        content = f'''"""MCP Server Kata: {idea_title}
+
+MISSION SPECS:
+{docstring_mission}
+"""
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Dict, Any
+{import_block}
 
 app = FastAPI(title="Micro-Capability Protocol Server")
 
@@ -1428,14 +1602,169 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
 '''
     else:
-        content = f'''"""Kata: {idea_title}"""
+        content = f'''"""Kata: {idea_title}
+
+MISSION SPECS:
+{docstring_mission}
+"""
+{import_block}
+
 def main():
     print("Implement your kata logic here.")
+    # Refer to the Mission Specs above for requirements.
 
 if __name__ == "__main__":
     main()
 '''
     main_py_path.write_text(content)
+
+
+def handle_play(args: argparse.Namespace) -> int:
+    """
+    Create a temporary playground environment.
+    """
+    # Create scratchpad directory
+    scratch_root = Path(DEFAULT_WORKSPACE) / "scratchpad"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    play_dir = scratch_root / f"playground_{timestamp}"
+    play_dir.mkdir()
+    
+    # Init simple environment
+    (play_dir / "main.py").write_text('"""NexusDojo Playground"""\n\ndef main():\n    print("Experimental mode.")\n\nif __name__ == "__main__":\n    main()\n')
+    (play_dir / "README.md").write_text("# Playground\n\nTransient environment. Deletes on cleanup.")
+    
+    console.print(f"[green]Opened playground at {play_dir.name}[/green]")
+    launch_session(play_dir)
+    
+    # Cleanup prompt after session ends
+    if Confirm.ask("Delete this playground session?"):
+        shutil.rmtree(play_dir)
+        console.print("Playground deleted.")
+    
+    return 0
+
+
+def handle_solve(args: argparse.Namespace) -> int:
+    """
+    Generate a solution for the current kata using the AI.
+    """
+    kata_root = Path(args.root or DEFAULT_KATA_ROOT).expanduser()
+    if args.project:
+        project_dir = kata_root / args.project
+    else:
+        project_dir = Path.cwd()
+
+    if not (project_dir / "MISSION.md").exists():
+        console.print("[red]Not a valid kata directory (missing MISSION.md).[/red]")
+        return 1
+
+    if not Confirm.ask("[bold red]WARNING:[/bold red] Using 'solve' forfeits XP for this kata. Continue?"):
+        return 0
+
+    console.print("[yellow]Consulting the Archives...[/yellow]")
+    
+    mission = (project_dir / "MISSION.md").read_text()
+    current_code = (project_dir / "main.py").read_text()
+    
+    system = "You are a Python Expert. Provide a complete, working solution for the given Mission. Output ONLY code."
+    user = f"Mission:\n{mission}\n\nCurrent Stub:\n{current_code}\n\nProvide the full solution for main.py."
+    
+    solution_code = call_idea_api(DEFAULT_IDEA_PROVIDER, DEFAULT_IDEA_MODEL, [{"role": "system", "content": system}, {"role": "user", "content": user}])
+    
+    if solution_code:
+        # Strip markdown fences if present
+        solution_code = solution_code.replace("```python", "").replace("```", "")
+        (project_dir / "solution.py").write_text(solution_code)
+        console.print(f"[green]Solution written to {project_dir / 'solution.py'}.[/green]")
+        
+        # Mark as cheated
+        meta_path = project_dir / ".kata.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            meta["cheated"] = True
+            meta_path.write_text(json.dumps(meta, indent=2))
+    else:
+        console.print("[red]Failed to generate solution.[/red]")
+        
+    return 0
+
+
+def handle_reset(args: argparse.Namespace) -> int:
+    """
+    Reset the kata to its initial state.
+    """
+    kata_root = Path(args.root or DEFAULT_KATA_ROOT).expanduser()
+    if args.project:
+        project_dir = kata_root / args.project
+    else:
+        project_dir = Path.cwd()
+
+    meta_path = project_dir / ".kata.json"
+    if not meta_path.exists():
+        console.print("[red]Cannot reset: missing .kata.json metadata.[/red]")
+        return 1
+
+    if not Confirm.ask("Reset main.py to boilerplate? This deletes your code."):
+        return 0
+
+    meta = json.loads(meta_path.read_text())
+    template = meta.get("template", "script")
+    
+    # Re-read Mission for injection
+    mission_content = ""
+    if (project_dir / "MISSION.md").exists():
+        mission_content = (project_dir / "MISSION.md").read_text()
+
+    # Determine title
+    readme = project_dir / "README.md"
+    title = "Kata"
+    if readme.exists():
+        title = readme.read_text().splitlines()[0].replace("#", "").strip()
+
+    set_default_main_py_content(project_dir, template, title, mission_content)
+    console.print("[green]Reset complete.[/green]")
+    return 0
+
+
+def install_dependencies(project_dir: Path) -> None:
+    """
+    Check for requirements.txt and install missing dependencies.
+    """
+    req_path = project_dir / "requirements.txt"
+    if not req_path.exists():
+        return
+
+    # Check if packages are installed (lazy check via pip freeze? Too slow).
+    # Better: Just run pip install if user approves.
+    # To reduce friction: Check if we are in venv.
+    
+    # Simplified Logic:
+    # 1. Read requirements.
+    # 2. If non-empty, ask to install.
+    reqs = req_path.read_text().strip()
+    if not reqs:
+        return
+
+    # We only prompt if we suspect they aren't installed? 
+    # Or we just do it silently/quickly if we are in the 'dojo check' flow?
+    # Let's prompt ONCE per session ideally, but for now, prompt if missing.
+    # Actually, let's just use pip install -r ... it's fast if already satisfied.
+    
+    # Only run if we haven't checked recently? 
+    # Let's add a marker file .deps_installed to avoid constant pip calls
+    if (project_dir / ".deps_installed").exists():
+        # Check timestamp? Nah, simple is better.
+        return
+
+    console.print("[yellow]Dependencies detected. Installing...[/yellow]")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req_path)], check=True, capture_output=True)
+        (project_dir / ".deps_installed").touch()
+        console.print("[green]Dependencies installed.[/green]")
+    except subprocess.CalledProcessError:
+        console.print("[red]Failed to install dependencies.[/red]")
 
 
 def handle_log(args: argparse.Namespace) -> int:
@@ -1696,261 +2025,337 @@ def handle_test_hints(args: argparse.Namespace) -> int:
     return 0
 
 
+def get_streak_heatmap(notes_root: Path, days: int = 5) -> str:
+    """
+    Generate a simple ASCII heatmap of recent activity.
+    """
+    log_path = notes_root / "log.md"
+    active_dates = set()
+    if log_path.exists():
+        for line in log_path.read_text().splitlines():
+            # Minimal parsing for speed
+            if line.startswith("- ["):
+                try:
+                    date_str = line[3:13] # YYYY-MM-DD
+                    active_dates.add(date_str)
+                except: pass
+    
+    heatmap = []
+    today = datetime.now().date()
+    for i in range(days - 1, -1, -1):
+        d = today - timedelta(days=i)
+        d_str = d.strftime("%Y-%m-%d")
+        if d_str in active_dates:
+            heatmap.append("[green]■[/green]")
+        else:
+            heatmap.append("[dim]□[/dim]")
+            
+    return " ".join(heatmap)
+
+
+def handle_history(args: argparse.Namespace) -> int:
+    """
+    Display a scrollable history of completed katas from the log.
+    """
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+    
+    # Collect all entries since forever (datetime.min)
+    entries = collect_entries(kata_root, notes_root, datetime.min)
+    
+    if not entries:
+        console.print("[yellow]No history found. Complete a kata to see it here![/yellow]")
+        return 0
+        
+    table = Table(title="📜 Kata History", box=box.SIMPLE, show_lines=True)
+    table.add_column("Date", style="cyan", no_wrap=True)
+    table.add_column("Project", style="green")
+    table.add_column("Notes", style="white")
+    
+    # Sort reverse chronological
+    for project, ts, note in sorted(entries, key=lambda x: x[1], reverse=True):
+        table.add_row(ts, project, note)
+        
+    console.print(table)
+    return 0
+
+
 def handle_menu(_: argparse.Namespace) -> int:
     """
     Interactive menu for common tasks (Rich UI).
     """
-    console.clear()
-    
     kata_root = Path(DEFAULT_KATA_ROOT)
     notes_root = Path(DEFAULT_NOTES_ROOT)
     notes_root.mkdir(parents=True, exist_ok=True) # Ensure notes dir exists
     
     # --- Onboarding Check ---
-    # If skills.json doesn't exist, we assume this is a new user (or reset).
     if not (notes_root / "skills.json").exists():
         return run_onboarding(notes_root)
 
-    # Gather context
-    recent = latest_activity(kata_root, notes_root)
-    # Load XP
-    skills = load_skills(notes_root)
-    # Load Settings for Name
-    settings = load_settings(notes_root)
-    user_name = settings.get("user_name", "Engineer")
-    
-    # Format Skills for Dashboard
-    skill_summary = []
-    for pillar, xp in skills.items():
-        if pillar == "mixed": continue
-        title, progress = get_level_info(xp)
-        skill_summary.append(f"{pillar.title()}: [bold]{title}[/bold] ({progress})")
-    
-    # Find weakest pillar by XP (excluding 0 if others exist, or just min)
-    # Filter mixed
-    valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
-    weakest_pillar = min(valid_skills, key=valid_skills.get) if valid_skills else "python"
-    
-    project = recent[0] if recent else None
-    hints_used = count_hints_today(notes_root)
-    
-    # --- Dashboard Header ---
-    dashboard_text = (
-        f"[bold gold1]Welcome back, {user_name}.[/bold gold1]\n\n"
-        f"[bold]Skill Profile:[/bold]\n" + "\n".join(f"• {s}" for s in skill_summary) + "\n\n"
-        f"[bold]Focus:[/bold] {weakest_pillar.title()} (Weakest)\n"
-        f"[bold]Hints Used Today:[/bold] {hints_used}"
-    )
-    
-    panel = Panel(
-        dashboard_text,
-        title="[bold white]NEXUS DOJO[/bold white]",
-        subtitle="[italic grey62]Mastery through repetition[/italic grey62]",
-        border_style="blue",
-        box=box.ROUNDED,
-        padding=(1, 2)
-    )
-    console.print(panel)
-    console.print()
-
-    # --- Menu Options ---
-    # We map display labels to internal action slugs
-    menu_options = [
-        (f"⚡ Quick Train ({weakest_pillar.title()})", "quick_train"),
-        ("🚀 Start New Session", "start_auto"),
-        ("▶️  Resume Last Kata", "continue"),
-        ("✅ Sensei Check (Run Tests)", "check"),
-        ("👀 Sensei Watch Mode", "watch"),
-        ("💡 Get Unstuck (Hint)", "hint"),
-        ("🛠️  Repair Workspace", "scaffold_refresh"),
-        ("📊 My Profile & Settings", "info"),
-        ("❓ Help & Workflow", "help"),
-        ("🚪 Exit", "exit"),
-    ]
-
-    for idx, (label, _) in enumerate(menu_options, start=1):
-        console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
-    
-    console.print()
-    console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
-    
-    choice = input().strip()
-    
-    # Map input to action
-    try:
-        idx = int(choice)
-        if 1 <= idx <= len(menu_options):
-            action = menu_options[idx - 1][1]
-        else:
-            console.print("[red]Invalid selection.[/red]")
-            return 1
-    except ValueError:
-        return 1
-
-    # --- Dispatcher ---
-    if action == "exit":
-        console.print(f"[blue]See you next time, {user_name}.[/blue]")
-        return 0
+    while True:
+        console.clear()
+        # Gather context refresh on every loop
+        recent = latest_activity(kata_root, notes_root)
+        skills = load_skills(notes_root)
+        settings = load_settings(notes_root)
+        user_name = settings.get("user_name", "Engineer")
         
-    if action == "info":
-        return handle_info(argparse.Namespace(notes_root=str(DEFAULT_NOTES_ROOT)))
-
-    if action == "help":
-        return handle_help(argparse.Namespace())
-
-    if action == "check":
-        return handle_check(argparse.Namespace(
-            project=None,
-            root=str(DEFAULT_KATA_ROOT),
-            notes_root=str(DEFAULT_NOTES_ROOT)
-        ))
-
-    if action == "watch":
-        return handle_watch(argparse.Namespace(
-            project=None,
-            root=str(DEFAULT_KATA_ROOT),
-            notes_root=str(DEFAULT_NOTES_ROOT)
-        ))
+        # Format Skills for Dashboard
+        skill_summary = []
+        for pillar, xp in skills.items():
+            if pillar == "mixed": continue
+            title, progress = get_level_info(xp)
+            skill_summary.append(f"{pillar.title()}: [bold]{title}[/bold] ({progress})")
         
-    if action == "dashboard": # Keep hidden access if needed, or route via Profile
-        return handle_dashboard(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+        valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
+        weakest_pillar = min(valid_skills, key=valid_skills.get) if valid_skills else "python"
         
-    if action == "continue":
-        return handle_continue(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+        # Calculate Total Stats
+        total_xp = sum(v for k, v in skills.items() if k != "mixed")
+        completed_katas = len(list_katas(kata_root))
+        
+        heatmap = get_streak_heatmap(notes_root)
+        
+        # --- Dashboard Header ---
+        dashboard_text = (
+            f"[bold gold1]Welcome back, {user_name}.[/bold gold1]\n\n"
+            f"[bold]Skill Profile:[/bold]\n" + "\n".join(f"• {s}" for s in skill_summary) + "\n\n"
+            f"[bold]Focus:[/bold] {weakest_pillar.title()} (Weakest)\n"
+            f"[bold]Total XP:[/bold] {total_xp}   [bold]Completed Drills:[/bold] {completed_katas}\n"
+            f"[bold]Consistency:[/bold] {heatmap} (Last 5 Days)"
+        )
+        
+        panel = Panel(
+            dashboard_text,
+            title="[bold white]NEXUS DOJO[/bold white]",
+            subtitle="[italic grey62]Mastery through repetition[/italic grey62]",
+            border_style="blue",
+            box=box.ROUNDED,
+            padding=(1, 2)
+        )
+        console.print(panel)
+        console.print()
 
-    if action == "quick_train":
-        # The Magic Button Logic
-        # weakest_pillar is already calculated above
-        
-        current_xp = skills.get(weakest_pillar, 0)
-        level_title, _ = get_level_info(current_xp)
-        
-        # Adaptive difficulty: If they are Novice, give Foundation. If Apprentice/Journeyman, give Proficient.
-        # If Expert/Master, give Stretch.
-        if level_title == "Novice":
-            difficulty = "foundation"
-        elif level_title in ["Apprentice", "Journeyman"]:
-            difficulty = "proficient"
-        else:
-            difficulty = "stretch"
+        # --- Menu Options ---
+        menu_options = [
+            (f"⚡ Quick Train (AI-Guided)", "quick_train"),
+            ("🚀 Start New Session (Manual)", "start_auto"),
+            ("▶️  Resume Last Kata", "continue"),
+            ("✅ Sensei Check (Run Tests)", "check"),
+            ("👀 Sensei Watch Mode", "watch"),
+            ("💡 Get Unstuck (Hint)", "hint"),
+            ("📊 Profile & History", "profile_history"),
+            ("❓ Help & Workflow", "help"),
+            ("🚪 Exit", "exit"),
+        ]
 
-        # Adaptive mode: If API/Mixed, lean towards API template. If Python/CLI, script.
-        target_mode = "fastapi" if weakest_pillar == "api" else "script"
-
-        with console.status(f"[bold green]Analysing stats... Weakest: {weakest_pillar.upper()} ({level_title}). Generating {difficulty} drill...[/bold green]", spinner="dots"):
-            idea, used_fallback = pick_idea_with_hints(
-                provider=DEFAULT_IDEA_PROVIDER,
-                model=DEFAULT_IDEA_MODEL,
-                kata_root=Path(DEFAULT_KATA_ROOT),
-                notes_root=Path(DEFAULT_NOTES_ROOT),
-                pillar_hint=weakest_pillar,
-                level_hint=difficulty,
-                mode_hint=target_mode,
-                offline=False,
-            )
+        for idx, (label, _) in enumerate(menu_options, start=1):
+            console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
         
-        if not idea:
-            console.print("[red]Could not generate an idea.[/red]")
-            return 1
-
-        console.print(Panel(f"[bold]{idea}[/bold]", title=f"⚡ Quick Train: {weakest_pillar.title()} ({difficulty})", border_style="yellow"))
+        console.print()
+        console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
         
-        console.print("[dim]Launching in 3 seconds... (Ctrl+C to cancel)[/dim]")
-        import time
+        choice = input().strip()
+        
+        # Map input to action
         try:
-            time.sleep(3)
-        except KeyboardInterrupt:
+            idx = int(choice)
+            if 1 <= idx <= len(menu_options):
+                action = menu_options[idx - 1][1]
+            else:
+                console.print("[red]Invalid selection.[/red]")
+                import time; time.sleep(1)
+                continue
+        except ValueError:
+            continue
+
+        # --- Dispatcher ---
+        if action == "exit":
+            console.print(f"[blue]See you next time, {user_name}.[/blue]")
             return 0
-
-        return handle_start(
-            argparse.Namespace(
-                idea=idea,
-                template="fastapi" if target_mode == "fastapi" else "script",
-                root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT),
-                force=False,
-                pillar=weakest_pillar,
-                mode=target_mode,
-                level=difficulty,
-                tests="edge",
-                guided=False,
-                reuse_settings=False,
-                yes=True, # Auto-confirm
-                scaffold="auto",
-                offline=False,
-            )
-        )
-        
-    if action == "hint":
-        project = Prompt.ask("Kata slug")
-        question = Prompt.ask("Question focus (optional)")
-        return handle_hint(
-            argparse.Namespace(
-                project=project,
-                question=question,
-                provider=DEFAULT_IDEA_PROVIDER,
-                model=DEFAULT_IDEA_MODEL,
-                root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT),
-                dry_run=False,
-                offline=False,
-            )
-        )
-        
-    if action == "scaffold_refresh":
-        project = Prompt.ask("Kata slug")
-        if not project:
-            return 1
-        return handle_scaffold_refresh(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
-        
-    if action == "start_auto":
-        pillar = Prompt.ask("Focus pillar", choices=["python", "cli", "api", "testing", "mixed"], default="mixed")
-        mode = Prompt.ask("Mode", choices=["script", "api"], default="script")
-        template = "fastapi" if mode == "api" else "script"
-        level = Prompt.ask("Difficulty", choices=["foundation", "proficient", "stretch"], default="foundation")
-
-        with console.status("[bold green]Generating challenge idea...[/bold green]", spinner="dots"):
-            idea, used_fallback = pick_idea_with_hints(
-                provider=DEFAULT_IDEA_PROVIDER,
-                model=DEFAULT_IDEA_MODEL,
-                kata_root=Path(DEFAULT_KATA_ROOT),
-                notes_root=Path(DEFAULT_NOTES_ROOT),
-                pillar_hint=pillar,
-                level_hint=level,
-                mode_hint=mode,
-                offline=False,
-            )
             
-        if not idea:
-            console.print("[red]Could not generate an idea.[/red]")
-            return 1
+        if action == "profile_history":
+            handle_history(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+            console.print()
+            handle_info(argparse.Namespace(notes_root=str(DEFAULT_NOTES_ROOT)))
+            
+        elif action == "help":
+            handle_help(argparse.Namespace())
 
-        console.print(Panel(f"[bold]{idea}[/bold]", title="Proposed Kata", border_style="green"))
-        
-        if not Confirm.ask("Create this kata?", default=True):
-            console.print("Cancelled.")
-            return 0
-
-        return handle_start(
-            argparse.Namespace(
-                idea=idea,
-                template=template,
+        elif action == "check":
+            handle_check(argparse.Namespace(
+                project=None,
                 root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT),
-                force=False,
-                pillar=pillar,
-                mode=mode,
-                level=level,
-                tests="edge",
-                guided=False,
-                reuse_settings=False,
-                yes=True,
-                scaffold="auto",
-                offline=False,
+                notes_root=str(DEFAULT_NOTES_ROOT)
+            ))
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "watch":
+            handle_watch(argparse.Namespace(
+                project=None,
+                root=str(DEFAULT_KATA_ROOT),
+                notes_root=str(DEFAULT_NOTES_ROOT)
+            ))
+            
+        elif action == "play":
+            handle_play(argparse.Namespace())
+            
+        elif action == "solve":
+            project = Prompt.ask("Kata slug")
+            handle_solve(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "reset":
+            project = Prompt.ask("Kata slug")
+            handle_reset(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "dashboard":
+            handle_dashboard(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "continue":
+            handle_continue(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "hint":
+            project = Prompt.ask("Kata slug")
+            question = Prompt.ask("Question focus (optional)")
+            handle_hint(
+                argparse.Namespace(
+                    project=project,
+                    question=question,
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    root=str(DEFAULT_KATA_ROOT),
+                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    dry_run=False,
+                    offline=False,
+                )
             )
-        )
-        
-    return 0
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "scaffold_refresh":
+            project = Prompt.ask("Kata slug")
+            if project:
+                handle_scaffold_refresh(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
+                Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "start_auto":
+            pillar = Prompt.ask("Focus pillar", choices=["python", "cli", "api", "testing", "mixed"], default="mixed")
+            mode = Prompt.ask("Mode", choices=["script", "api"], default="script")
+            template = "fastapi" if mode == "api" else "script"
+            level = Prompt.ask("Difficulty", choices=["foundation", "proficient", "stretch"], default="foundation")
+
+            with console.status("[bold green]Generating challenge idea...[/bold green]", spinner="dots"):
+                idea, used_fallback = pick_idea_with_hints(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=Path(DEFAULT_KATA_ROOT),
+                    notes_root=Path(DEFAULT_NOTES_ROOT),
+                    pillar_hint=pillar,
+                    level_hint=level,
+                    mode_hint=mode,
+                    offline=False,
+                )
+                
+            if not idea:
+                console.print("[red]Could not generate an idea.[/red]")
+                import time; time.sleep(2)
+                continue
+
+            console.print(Panel(f"[bold]{idea}[/bold]", title="Proposed Kata", border_style="green"))
+            
+            if not Confirm.ask("Create this kata?", default=True):
+                console.print("Cancelled.")
+                continue
+
+            handle_start(
+                argparse.Namespace(
+                    idea=idea,
+                    template=template,
+                    root=str(DEFAULT_KATA_ROOT),
+                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    force=False,
+                    pillar=pillar,
+                    mode=mode,
+                    level=level,
+                    tests="edge",
+                    guided=False,
+                    reuse_settings=False,
+                    yes=True,
+                    scaffold="auto",
+                    offline=False,
+                )
+            )
+            # handle_start prints next steps. We exit the menu so they can go code?
+            # Or we loop back?
+            # Typically user wants to exit menu to go to terminal.
+            # But let's ask.
+            if Confirm.ask("Exit menu to start coding?"):
+                return 0
+
+        elif action == "quick_train":
+            # ... (Existing Quick Train Logic) ...
+            # Reuse the vars we loaded at start of loop
+            current_xp = skills.get(weakest_pillar, 0)
+            level_title, _ = get_level_info(current_xp)
+            
+            if level_title == "Novice":
+                difficulty = "foundation"
+            elif level_title in ["Apprentice", "Journeyman"]:
+                difficulty = "proficient"
+            else:
+                difficulty = "stretch"
+
+            target_mode = "fastapi" if weakest_pillar == "api" else "script"
+
+            with console.status(f"[bold green]Analysing stats... Weakest: {weakest_pillar.upper()} ({level_title}). Generating {difficulty} drill...[/bold green]", spinner="dots"):
+                idea, used_fallback = pick_idea_with_hints(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=Path(DEFAULT_KATA_ROOT),
+                    notes_root=Path(DEFAULT_NOTES_ROOT),
+                    pillar_hint=weakest_pillar,
+                    level_hint=difficulty,
+                    mode_hint=target_mode,
+                    offline=False,
+                )
+            
+            if not idea:
+                console.print("[red]Could not generate an idea.[/red]")
+                import time; time.sleep(2)
+                continue
+
+            console.print(Panel(f"[bold]{idea}[/bold]", title=f"⚡ Quick Train: {weakest_pillar.title()} ({difficulty})", border_style="yellow"))
+            
+            console.print("[dim]Launching in 3 seconds... (Ctrl+C to cancel)[/dim]")
+            import time
+            try:
+                time.sleep(3)
+            except KeyboardInterrupt:
+                continue
+
+            handle_start(
+                argparse.Namespace(
+                    idea=idea,
+                    template="fastapi" if target_mode == "fastapi" else "script",
+                    root=str(DEFAULT_KATA_ROOT),
+                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    force=False,
+                    pillar=weakest_pillar,
+                    mode=target_mode,
+                    level=difficulty,
+                    tests="edge",
+                    guided=False,
+                    reuse_settings=False,
+                    yes=True, 
+                    scaffold="auto",
+                    offline=False,
+                )
+            )
+            # Auto-exit to let them code
+            return 0
 
 
 def handle_idea(args: argparse.Namespace) -> int:
@@ -2223,7 +2628,7 @@ def call_idea_api(provider: str, model: str, messages: list[dict[str, str]]) -> 
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=30) as resp:
+            with urllib.request.urlopen(request, timeout=120) as resp:
                 raw = resp.read()
                 data = json.loads(raw.decode("utf-8"))
                 content = ""
@@ -2255,7 +2660,7 @@ def call_idea_api(provider: str, model: str, messages: list[dict[str, str]]) -> 
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=30) as resp:
+            with urllib.request.urlopen(request, timeout=120) as resp:
                 raw = resp.read()
                 data = json.loads(raw.decode("utf-8"))
                 content = (
