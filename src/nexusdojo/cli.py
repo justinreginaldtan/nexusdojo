@@ -738,10 +738,12 @@ def handle_check(args: argparse.Namespace) -> int:
             border_style="red",
             box=box.HEAVY
         ))
-        
-        # Show specific errors (truncated if too long)
         error_out = result.stderr or result.stdout
-        console.print(f"[dim]{error_out.strip()}[/dim]")
+        if getattr(args, "truncate_output", False):
+            console.print(f"[dim]{summarize_failure_output(error_out)}[/dim]")
+            console.print("[dim]Run full `dojo check` for complete output.[/dim]")
+        else:
+            console.print(f"[dim]{error_out.strip()}[/dim]")
         
         console.print("\n[bold yellow]Analyzing failure...[/bold yellow]")
         
@@ -775,6 +777,30 @@ def load_skills(notes_root: Path) -> dict[str, int]:
 def save_skills(notes_root: Path, skills: dict[str, int]) -> None:
     path = notes_root / "skills.json"
     path.write_text(json.dumps(skills, indent=2))
+
+
+def format_pillar_label(pillar: str) -> str:
+    """
+    Normalize pillar labels for display (e.g., CLI, API).
+    """
+    mapping = {"cli": "CLI", "api": "API", "python": "Python", "testing": "Testing", "mixed": "Mixed"}
+    return mapping.get(pillar, pillar.title())
+
+
+def summarize_failure_output(output: str, max_lines: int = 20, max_chars: int = 1200) -> str:
+    """
+    Produce a short, readable failure summary to avoid scrollback spam.
+    """
+    if not output:
+        return ""
+    lines = output.splitlines()
+    trimmed = "\n".join(lines[:max_lines])
+    if len(lines) > max_lines:
+        trimmed += f"\n... ({len(lines) - max_lines} more lines truncated)"
+    if len(trimmed) > max_chars:
+        trimmed = trimmed[:max_chars].rstrip() + "\n... (truncated)"
+    return trimmed
+
 
 def get_level_info(xp: int) -> tuple[str, str]:
     """Returns (Level Title, Next Level Progress)."""
@@ -1763,8 +1789,12 @@ def install_dependencies(project_dir: Path) -> None:
         subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req_path)], check=True, capture_output=True)
         (project_dir / ".deps_installed").touch()
         console.print("[green]Dependencies installed.[/green]")
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
         console.print("[red]Failed to install dependencies.[/red]")
+        stderr = (exc.stderr or "").strip()
+        if stderr:
+            console.print(f"[dim]{summarize_failure_output(stderr)}[/dim]")
+        console.print(f"[yellow]Try manually running:[/yellow] {sys.executable} -m pip install -r {req_path}")
 
 
 def handle_log(args: argparse.Namespace) -> int:
@@ -1860,6 +1890,7 @@ def handle_dashboard(args: argparse.Namespace) -> int:
     notes_root = Path(args.notes_root).expanduser()
 
     katas = list_katas(kata_root)
+    completed_drills = count_completed_drills(kata_root, notes_root)
     recent = latest_activity(kata_root, notes_root)
     calib_path = notes_root / "calibrations.md"
     scores = parse_calibrations(calib_path) if calib_path.exists() else {}
@@ -1871,6 +1902,7 @@ def handle_dashboard(args: argparse.Namespace) -> int:
 
     print("NexusDojo dashboard")
     print(f"- Katas: {len(katas)} ({', '.join(katas[-3:]) or 'none'})")
+    print(f"- Completed drills (with history): {completed_drills}")
     print(f"- Weakest pillar: {weakest or 'unknown'} | Trend: {trend or 'no history'}")
     print(f"- Practice balance: {balance or 'log a calibration to start'}")
     if recent:
@@ -2080,49 +2112,96 @@ def handle_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def find_active_kata_dir(start: Path) -> Optional[Path]:
+    """
+    Walk upward from start to find the nearest kata folder (MISSION.md present).
+    """
+    for candidate in [start] + list(start.parents):
+        if (candidate / "MISSION.md").exists():
+            return candidate
+    return None
+
+
+def resolve_last_kata(kata_root: Path, notes_root: Path) -> tuple[Optional[str], Optional[Path]]:
+    """
+    Determine the last active kata slug and its directory (if it still exists).
+    """
+    recent = latest_activity(kata_root, notes_root)
+    if not recent:
+        return None, None
+    project = recent[0]
+    target_dir = kata_root / project
+    return project, target_dir if target_dir.exists() else None
+
+
 def handle_menu(_: argparse.Namespace) -> int:
     """
     Interactive menu for common tasks (Rich UI).
     """
-    kata_root = Path(DEFAULT_KATA_ROOT)
-    notes_root = Path(DEFAULT_NOTES_ROOT)
+    kata_root = Path(DEFAULT_KATA_ROOT).expanduser()
+    notes_root = Path(DEFAULT_NOTES_ROOT).expanduser()
     notes_root.mkdir(parents=True, exist_ok=True) # Ensure notes dir exists
     
     # --- Onboarding Check ---
     if not (notes_root / "skills.json").exists():
         return run_onboarding(notes_root)
 
+    force_lobby_view = False
+
     while True:
         console.clear()
         # Gather context refresh on every loop
-        recent = latest_activity(kata_root, notes_root)
+        active_kata_dir = find_active_kata_dir(Path.cwd())
+        in_kata_context = active_kata_dir is not None and not force_lobby_view
+
         skills = load_skills(notes_root)
         settings = load_settings(notes_root)
         user_name = settings.get("user_name", "Engineer")
+        recent_entries = collect_entries(kata_root, notes_root, datetime.min)
         
         # Format Skills for Dashboard
         skill_summary = []
         for pillar, xp in skills.items():
             if pillar == "mixed": continue
             title, progress = get_level_info(xp)
-            skill_summary.append(f"{pillar.title()}: [bold]{title}[/bold] ({progress})")
+            skill_summary.append(f"{format_pillar_label(pillar)}: [bold]{title}[/bold] ({progress})")
         
         valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
         weakest_pillar = min(valid_skills, key=valid_skills.get) if valid_skills else "python"
         
         # Calculate Total Stats
         total_xp = sum(v for k, v in skills.items() if k != "mixed")
-        completed_katas = len(list_katas(kata_root))
+        completed_drills = count_completed_drills(kata_root, notes_root)
         
         heatmap = get_streak_heatmap(notes_root)
+        resume_slug, resume_dir = resolve_last_kata(kata_root, notes_root)
+        resume_label = "▶️  Resume Last Kata"
+        if resume_slug:
+            resume_label = f"▶️  Resume Last Kata: {resume_slug}"
+        else:
+            resume_label += " (none yet)"
+
+        context_line = "[bold]Context:[/bold] Lobby (no kata detected here)"
+        if active_kata_dir:
+            kata_label = f"Kata detected: {active_kata_dir.name} ({active_kata_dir.resolve()})"
+            context_line = f"[bold]Context:[/bold] {kata_label}" if in_kata_context else f"[bold]Context:[/bold] Lobby view - {kata_label}"
+
+        # Recent history (last 3 entries)
+        recent_block = "No history yet."
+        if recent_entries:
+            tail = recent_entries[-3:]
+            recent_lines = [f"{proj} @ {ts}: {note}" for proj, ts, note in tail]
+            recent_block = "\n".join(recent_lines)
         
         # --- Dashboard Header ---
         dashboard_text = (
             f"[bold gold1]Welcome back, {user_name}.[/bold gold1]\n\n"
             f"[bold]Skill Profile:[/bold]\n" + "\n".join(f"• {s}" for s in skill_summary) + "\n\n"
-            f"[bold]Focus:[/bold] {weakest_pillar.title()} (Weakest)\n"
-            f"[bold]Total XP:[/bold] {total_xp}   [bold]Completed Drills:[/bold] {completed_katas}\n"
-            f"[bold]Consistency:[/bold] {heatmap} (Last 5 Days)"
+            f"[bold]Focus:[/bold] {format_pillar_label(weakest_pillar)} (Weakest)\n"
+            f"[bold]Total XP:[/bold] {total_xp}   [bold]Completed Drills:[/bold] {completed_drills}\n"
+            f"[bold]Consistency:[/bold] {heatmap} (Last 5 Days)\n"
+            f"{context_line}\n"
+            f"[bold]Recent activity:[/bold]\n{recent_block}"
         )
         
         panel = Panel(
@@ -2137,17 +2216,28 @@ def handle_menu(_: argparse.Namespace) -> int:
         console.print()
 
         # --- Menu Options ---
-        menu_options = [
-            (f"⚡ Quick Train (AI-Guided)", "quick_train"),
-            ("🚀 Start New Session (Manual)", "start_auto"),
-            ("▶️  Resume Last Kata", "continue"),
-            ("✅ Sensei Check (Run Tests)", "check"),
-            ("👀 Sensei Watch Mode", "watch"),
-            ("💡 Get Unstuck (Hint)", "hint"),
-            ("📊 Profile & History", "profile_history"),
-            ("❓ Help & Workflow", "help"),
-            ("🚪 Exit", "exit"),
-        ]
+        if in_kata_context:
+            menu_options = [
+                ("✅ Sensei Check (Run Tests)", "check"),
+                ("👀 Sensei Watch Mode", "watch"),
+                ("💡 Get Unstuck (Hint)", "hint"),
+                ("📄 Peek This Kata (README/LOG)", "peek_current"),
+                ("🧹 Reset Kata", "reset_kata"),
+                ("🧠 Request Solution (Zero XP)", "solve_kata"),
+                ("🔙 Return to Lobby Menu", "return_lobby"),
+            ]
+        else:
+            menu_options = [
+                ("⚡ Quick Train (AI-Guided)", "quick_train"),
+                ("🚀 Start New Session (Manual)", "start_auto"),
+                (resume_label, "resume"),
+                ("📄 Peek Last Kata (README/LOG)", "peek_resume"),
+                ("📊 Profile & History", "profile_history"),
+                ("❓ Help & Workflow", "help"),
+                ("🚪 Exit", "exit"),
+            ]
+            if force_lobby_view and active_kata_dir:
+                menu_options.insert(-1, ("⬅️ Back to Kata Tools", "back_to_kata"))
 
         for idx, (label, _) in enumerate(menu_options, start=1):
             console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
@@ -2175,70 +2265,142 @@ def handle_menu(_: argparse.Namespace) -> int:
             return 0
             
         if action == "profile_history":
-            handle_history(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
+            handle_history(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
             console.print()
-            handle_info(argparse.Namespace(notes_root=str(DEFAULT_NOTES_ROOT)))
+            handle_info(argparse.Namespace(notes_root=str(notes_root)))
             
         elif action == "help":
             handle_help(argparse.Namespace())
 
         elif action == "check":
+            target_root = str(active_kata_dir.parent if active_kata_dir else kata_root)
+            target_project = active_kata_dir.name if active_kata_dir else None
             handle_check(argparse.Namespace(
-                project=None,
-                root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT)
+                project=target_project,
+                root=target_root,
+                notes_root=str(notes_root),
+                truncate_output=True
             ))
             Prompt.ask("\nPress Enter to return to menu")
             
         elif action == "watch":
+            target_root = str(active_kata_dir.parent if active_kata_dir else kata_root)
+            target_project = active_kata_dir.name if active_kata_dir else None
             handle_watch(argparse.Namespace(
-                project=None,
-                root=str(DEFAULT_KATA_ROOT),
-                notes_root=str(DEFAULT_NOTES_ROOT)
+                project=target_project,
+                root=target_root,
+                notes_root=str(notes_root)
             ))
             
-        elif action == "play":
-            handle_play(argparse.Namespace())
-            
-        elif action == "solve":
-            project = Prompt.ask("Kata slug")
-            handle_solve(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
-            Prompt.ask("\nPress Enter to return to menu")
-            
-        elif action == "reset":
-            project = Prompt.ask("Kata slug")
-            handle_reset(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
-            Prompt.ask("\nPress Enter to return to menu")
-
-        elif action == "dashboard":
-            handle_dashboard(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
-            Prompt.ask("\nPress Enter to return to menu")
-
-        elif action == "continue":
-            handle_continue(argparse.Namespace(root=str(DEFAULT_KATA_ROOT), notes_root=str(DEFAULT_NOTES_ROOT)))
-            Prompt.ask("\nPress Enter to return to menu")
-
         elif action == "hint":
-            project = Prompt.ask("Kata slug")
-            question = Prompt.ask("Question focus (optional)")
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                import time; time.sleep(1)
+                continue
+            question = Prompt.ask("Question focus (optional)", default="")
             handle_hint(
                 argparse.Namespace(
-                    project=project,
+                    project=active_kata_dir.name,
                     question=question,
                     provider=DEFAULT_IDEA_PROVIDER,
                     model=DEFAULT_IDEA_MODEL,
-                    root=str(DEFAULT_KATA_ROOT),
-                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    root=str(active_kata_dir.parent),
+                    notes_root=str(notes_root),
                     dry_run=False,
                     offline=False,
                 )
             )
             Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "peek_current":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                import time; time.sleep(1)
+                continue
+            peek_kata_summary(active_kata_dir, notes_root)
+            Prompt.ask("\nPress Enter to return to menu")
             
+        elif action == "reset_kata":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                import time; time.sleep(1)
+                continue
+            handle_reset(argparse.Namespace(project=active_kata_dir.name, root=str(active_kata_dir.parent)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "solve_kata":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                import time; time.sleep(1)
+                continue
+            handle_solve(argparse.Namespace(project=active_kata_dir.name, root=str(active_kata_dir.parent)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "return_lobby":
+            force_lobby_view = True
+            continue
+
+        elif action == "back_to_kata":
+            force_lobby_view = False
+            continue
+
+        elif action == "play":
+            handle_play(argparse.Namespace())
+            
+        elif action == "solve":
+            project = Prompt.ask("Kata slug")
+            handle_solve(argparse.Namespace(project=project, root=str(kata_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "reset":
+            project = Prompt.ask("Kata slug")
+            handle_reset(argparse.Namespace(project=project, root=str(kata_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "dashboard":
+            handle_dashboard(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "continue":
+            handle_continue(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "peek_resume":
+            if not resume_dir or not resume_dir.exists():
+                console.print("[yellow]No recent kata to preview yet.[/yellow]")
+            else:
+                peek_kata_summary(resume_dir, notes_root)
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "resume":
+            if not resume_slug:
+                console.print("[yellow]No recent kata to resume yet. Start a new session first.[/yellow]")
+                import time; time.sleep(1.5)
+                continue
+            if not resume_dir or not resume_dir.exists():
+                console.print(f"[red]Last kata '{resume_slug}' not found at {resume_dir}.[/red]")
+                Prompt.ask("\nPress Enter to return to menu")
+                continue
+            if Confirm.ask("Run quick test preview before launch?", default=True):
+                passed, summary = quick_check_preview(resume_dir, notes_root)
+                style = "green" if passed else "red"
+                console.print(Panel(summary, title="Test Preview", border_style=style))
+            if not Confirm.ask("Launch training environment now?", default=True):
+                console.print(Panel(
+                    f"Path: {resume_dir.resolve()}\n"
+                    f"- cd {resume_dir.name}\n- Read MISSION.md\n- Run `dojo check`\n- Open main.py",
+                    title="Next Steps",
+                    border_style="yellow"
+                ))
+                Prompt.ask("\nPress Enter to return to menu")
+                continue
+            launch_session(resume_dir)
+            continue
+
         elif action == "scaffold_refresh":
             project = Prompt.ask("Kata slug")
             if project:
-                handle_scaffold_refresh(argparse.Namespace(project=project, root=str(DEFAULT_KATA_ROOT)))
+                handle_scaffold_refresh(argparse.Namespace(project=project, root=str(kata_root)))
                 Prompt.ask("\nPress Enter to return to menu")
             
         elif action == "start_auto":
@@ -2248,11 +2410,11 @@ def handle_menu(_: argparse.Namespace) -> int:
             level = Prompt.ask("Difficulty", choices=["foundation", "proficient", "stretch"], default="foundation")
 
             with console.status("[bold green]Generating challenge idea...[/bold green]", spinner="dots"):
-                idea, used_fallback = pick_idea_with_hints(
+                idea, _ = pick_idea_with_hints(
                     provider=DEFAULT_IDEA_PROVIDER,
                     model=DEFAULT_IDEA_MODEL,
-                    kata_root=Path(DEFAULT_KATA_ROOT),
-                    notes_root=Path(DEFAULT_NOTES_ROOT),
+                    kata_root=kata_root,
+                    notes_root=notes_root,
                     pillar_hint=pillar,
                     level_hint=level,
                     mode_hint=mode,
@@ -2274,8 +2436,8 @@ def handle_menu(_: argparse.Namespace) -> int:
                 argparse.Namespace(
                     idea=idea,
                     template=template,
-                    root=str(DEFAULT_KATA_ROOT),
-                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    root=str(kata_root),
+                    notes_root=str(notes_root),
                     force=False,
                     pillar=pillar,
                     mode=mode,
@@ -2311,11 +2473,11 @@ def handle_menu(_: argparse.Namespace) -> int:
             target_mode = "fastapi" if weakest_pillar == "api" else "script"
 
             with console.status(f"[bold green]Analysing stats... Weakest: {weakest_pillar.upper()} ({level_title}). Generating {difficulty} drill...[/bold green]", spinner="dots"):
-                idea, used_fallback = pick_idea_with_hints(
+                idea, _ = pick_idea_with_hints(
                     provider=DEFAULT_IDEA_PROVIDER,
                     model=DEFAULT_IDEA_MODEL,
-                    kata_root=Path(DEFAULT_KATA_ROOT),
-                    notes_root=Path(DEFAULT_NOTES_ROOT),
+                    kata_root=kata_root,
+                    notes_root=notes_root,
                     pillar_hint=weakest_pillar,
                     level_hint=difficulty,
                     mode_hint=target_mode,
@@ -2340,8 +2502,8 @@ def handle_menu(_: argparse.Namespace) -> int:
                 argparse.Namespace(
                     idea=idea,
                     template="fastapi" if target_mode == "fastapi" else "script",
-                    root=str(DEFAULT_KATA_ROOT),
-                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    root=str(kata_root),
+                    notes_root=str(notes_root),
                     force=False,
                     pillar=weakest_pillar,
                     mode=target_mode,
@@ -2478,6 +2640,54 @@ def collect_entries(kata_root: Path, notes_root: Path, since: datetime) -> list[
             deduped.append(entry)
             seen.add(entry)
     return deduped
+
+
+def count_completed_drills(kata_root: Path, notes_root: Path) -> int:
+    """
+    Count distinct kata projects that have history entries (excludes central log only entries).
+    """
+    entries = collect_entries(kata_root, notes_root, datetime.min)
+    projects = {project for project, _, _ in entries if project and project != "central"}
+    return len(projects)
+
+
+def quick_check_preview(project_dir: Path, notes_root: Path) -> tuple[bool, str]:
+    """
+    Run a lightweight unittest check and return (passed, summary).
+    """
+    if not (project_dir / "tests").exists():
+        return False, "No tests folder found."
+    install_dependencies(project_dir)
+    result = subprocess.run(
+        [sys.executable, "-m", "unittest"],
+        cwd=project_dir,
+        capture_output=True,
+        text=True
+    )
+    output = result.stderr or result.stdout
+    summary = summarize_failure_output(output)
+    if result.returncode == 0:
+        return True, "Tests passed in preview."
+    return False, summary or "Tests failed (no output captured)."
+
+
+def peek_kata_summary(project_dir: Path, notes_root: Path) -> None:
+    """
+    Display a compact summary of a kata without launching the session.
+    """
+    readme = (project_dir / "README.md").read_text().splitlines() if (project_dir / "README.md").exists() else []
+    mission = (project_dir / "MISSION.md").read_text().splitlines() if (project_dir / "MISSION.md").exists() else []
+    log_hint = last_lines(project_dir / "LOG.md", 3) if (project_dir / "LOG.md").exists() else "No project log yet."
+    mission_excerpt = "\n".join(mission[:6]) if mission else "MISSION.md missing."
+    readme_title = readme[0].lstrip("# ").strip() if readme else "README missing."
+
+    body = (
+        f"[bold]Path:[/bold] {project_dir.resolve()}\n"
+        f"[bold]README:[/bold] {readme_title}\n\n"
+        f"[bold]MISSION excerpt:[/bold]\n{mission_excerpt}\n\n"
+        f"[bold]Recent log:[/bold]\n{log_hint}"
+    )
+    console.print(Panel(body, title=f"📄 {project_dir.name}", border_style="cyan"))
 
 
 def build_idea_prompt(
