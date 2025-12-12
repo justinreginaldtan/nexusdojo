@@ -1068,9 +1068,10 @@ def handle_check(args: argparse.Namespace) -> int:
 
         # Mark tutorial complete if applicable
         if project_dir.name == "tutorial-hello":
-            marker = notes_root / ".tutorial_complete"
+            current_profile = get_current_profile_name(notes_root) or "default"
+            marker = notes_root / f".tutorial_complete.{current_profile}"
             marker.write_text("tutorial complete", encoding="utf-8")
-            console.print("[bold green]Tutorial complete! Returning you to the main menu next time.[/bold green]")
+            console.print(f"[bold green]Tutorial complete for profile '{current_profile}'! Returning you to the main menu next time.[/bold green]")
 
         # --- Progression System ---
         kata_meta_path = project_dir / ".kata.json"
@@ -1230,14 +1231,16 @@ def is_first_time_user(kata_root: Path, notes_root: Path) -> bool:
     """
     Determine if the user is brand new (no katas/logs and no tutorial marker).
     """
-    marker = notes_root / ".tutorial_complete"
+    current = get_current_profile_name(notes_root) or "default"
+    marker = notes_root / f".tutorial_complete.{current}"
     if marker.exists():
         return False
-    has_logs = (notes_root / "log.md").exists() and (notes_root / "log.md").stat().st_size > 0
-    tutorial_exists = (kata_root / "tutorial-hello").exists()
-    has_katas = any((p / "tests").exists() for p in kata_root.iterdir() if p.is_dir())
-    if tutorial_exists and not marker.exists():
+    # Always allow tutorial if it exists and marker not set for this profile
+    if (kata_root / "tutorial-hello").exists():
         return True
+    # Otherwise check for any activity
+    has_logs = (notes_root / "log.md").exists() and (notes_root / "log.md").stat().st_size > 0
+    has_katas = any((p / "tests").exists() for p in kata_root.iterdir() if p.is_dir())
     return not has_logs and not has_katas
 
 
@@ -1565,6 +1568,93 @@ Rate the difficulty to adjust future drills:
     """
     console.print(Panel(Markdown(guide), title="Recommended Workflow", border_style="green"))
     Prompt.ask("Press Enter to return to menu")
+    return 0
+
+
+def handle_settings(args: argparse.Namespace) -> int:
+    """
+    Settings menu for configuring NexusDojo behavior.
+    """
+    notes_root = Path(args.notes_root)
+    settings = load_settings(notes_root)
+
+    while True:
+        console.clear()
+        console.print(Panel(
+            "[bold white]NEXUS DOJO SETTINGS[/bold white]",
+            border_style="cyan",
+            padding=(1, 2)
+        ))
+        console.print()
+
+        # Display current settings
+        ai_mode = settings.get("ai_enabled", True)
+        ai_provider = settings.get("ai_provider", "ollama")
+        ai_model = settings.get("ai_model", "llama2")
+
+        console.print(f"[bold]AI Integration:[/bold]")
+        console.print(f"  Status: [{'green' if ai_mode else 'red'}]{'Enabled' if ai_mode else 'Disabled'}[/]")
+        console.print(f"  Provider: {ai_provider}")
+        console.print(f"  Model: {ai_model}")
+        console.print()
+
+        # Menu
+        console.print("[bold]Options:[/bold]")
+        console.print(" [bold cyan]1[/bold cyan] Toggle AI Integration (On/Off)")
+        console.print(" [bold cyan]2[/bold cyan] Configure AI Provider")
+        console.print(" [bold cyan]3[/bold cyan] Configure AI Model")
+        console.print(" [bold cyan]4[/bold cyan] Return to Menu")
+        console.print()
+
+        choice = Prompt.ask("[italic grey50]Select option [1-4]:[/italic grey50]", choices=["1", "2", "3", "4"], default="4", show_choices=False)
+
+        if choice == "1":
+            # Toggle AI
+            settings["ai_enabled"] = not settings.get("ai_enabled", True)
+            save_settings(notes_root, settings)
+            console.print(f"\n[green]AI Integration {'enabled' if settings['ai_enabled'] else 'disabled'}.[/green]")
+            Prompt.ask("Press Enter to continue")
+
+        elif choice == "2":
+            # Configure Provider
+            console.print("\n[bold]Available Providers:[/bold]")
+            console.print(" [bold cyan]1[/bold cyan] Ollama (local, fast, free)")
+            console.print(" [bold cyan]2[/bold cyan] OpenRouter (remote, many models)")
+            provider_choice = Prompt.ask("Select provider [1-2]", choices=["1", "2"], default="1", show_choices=False)
+            if provider_choice == "1":
+                settings["ai_provider"] = "ollama"
+                settings["ai_model"] = "llama2"  # Default ollama model
+            elif provider_choice == "2":
+                settings["ai_provider"] = "openrouter"
+                settings["ai_model"] = "openai/gpt-4o-mini"  # Default openrouter model
+            save_settings(notes_root, settings)
+            console.print(f"\n[green]Provider set to {settings['ai_provider']}.[/green]")
+            Prompt.ask("Press Enter to continue")
+
+        elif choice == "3":
+            # Configure Model
+            provider = settings.get("ai_provider", "ollama")
+            if provider == "ollama":
+                console.print("\n[dim]Ollama models (common):[/dim]")
+                console.print("  - llama2")
+                console.print("  - neural-chat")
+                console.print("  - mistral")
+                model_input = Prompt.ask("Enter model name (default: llama2)", default="llama2")
+                settings["ai_model"] = model_input
+            else:
+                console.print("\n[dim]OpenRouter models (examples):[/dim]")
+                console.print("  - openai/gpt-4o-mini (fast)")
+                console.print("  - anthropic/claude-3-haiku")
+                console.print("  - google/gemini-2.0-flash-lite")
+                model_input = Prompt.ask("Enter model ID (default: openai/gpt-4o-mini)", default="openai/gpt-4o-mini")
+                settings["ai_model"] = model_input
+            save_settings(notes_root, settings)
+            console.print(f"\n[green]Model set to {settings['ai_model']}.[/green]")
+            Prompt.ask("Press Enter to continue")
+
+        elif choice == "4":
+            break
+
     return 0
 
 
@@ -3009,7 +3099,7 @@ def handle_menu(_: argparse.Namespace) -> int:
             top_grid.add_row(left, right)
 
             # Footer
-            footer_text = f"\"karmanyeva adhikaras te ma phaleshu kadachana\""
+            footer_text = f"Karmanyeva adhikaras te ma phaleshu kadachana"
             
             # Combine
             main_layout = Table.grid(expand=True)
@@ -3043,6 +3133,7 @@ def handle_menu(_: argparse.Namespace) -> int:
                     (resume_label, "resume"),
                     ("Profile & History", "profile_history"),
                     ("Help & Workflow", "help"),
+                    ("Settings", "settings"),
                     ("Exit", "exit"),
                 ]
                 if force_lobby_view and active_kata_dir:
@@ -3098,6 +3189,9 @@ def handle_menu(_: argparse.Namespace) -> int:
             
         elif action == "help":
             handle_help(argparse.Namespace())
+
+        elif action == "settings":
+            handle_settings(argparse.Namespace(notes_root=str(notes_root)))
 
         elif action == "check":
             target_root = str(active_kata_dir.parent if active_kata_dir else kata_root)
