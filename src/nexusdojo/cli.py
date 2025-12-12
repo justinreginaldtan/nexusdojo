@@ -2017,6 +2017,49 @@ def handle_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_history(args: argparse.Namespace) -> int:
+    """
+    Display recent log activity and practice stats.
+    """
+    kata_root = Path(args.root).expanduser()
+    notes_root = Path(args.notes_root).expanduser()
+    notes_root.mkdir(parents=True, exist_ok=True)
+
+    window_days = max(1, getattr(args, "days", 30))
+    since_dt = datetime.now() - timedelta(days=window_days)
+    recent_entries = collect_entries(kata_root, notes_root, since_dt)
+    all_entries = collect_entries(kata_root, notes_root, datetime.min)
+    completed_drills = count_completed_drills(kata_root, notes_root)
+    streak = get_streak_heatmap(notes_root, days=7)
+    last_entry = all_entries[-1] if all_entries else None
+
+    stats = Table(box=box.MINIMAL_DOUBLE_HEAD)
+    stats.add_column("Metric", style="cyan")
+    stats.add_column("Value", style="white")
+    stats.add_row("Completed katas", str(completed_drills))
+    stats.add_row("Log entries", str(len(all_entries)))
+    stats.add_row("7d streak", streak)
+    if last_entry:
+        stats.add_row("Last entry", f"{last_entry[1]} — {last_entry[0]}")
+    else:
+        stats.add_row("Last entry", "No history yet")
+
+    console.print(Panel(stats, title="📊 Profile & History", border_style="cyan"))
+
+    activity = Table(title=f"Recent activity (last {window_days} days)", box=box.MINIMAL)
+    activity.add_column("When", style="cyan", no_wrap=True)
+    activity.add_column("Project", style="green", no_wrap=True)
+    activity.add_column("Note", style="white")
+    if recent_entries:
+        for project, ts, note in recent_entries[-10:]:
+            activity.add_row(ts, project or "central", summarize_text(note, 80))
+    else:
+        activity.add_row("-", "-", "No entries yet. Finish a kata and log a note to populate this.")
+    console.print(activity)
+    console.print()
+    return 0
+
+
 def handle_continue(args: argparse.Namespace) -> int:
     """
     Show the most recent kata and where to resume.
@@ -2460,7 +2503,6 @@ def handle_menu(_: argparse.Namespace) -> int:
                     ("⚡ Quick Train (AI-Guided)", "quick_train"),
                     ("🚀 Start New Session (Manual)", "start_auto"),
                     (resume_label, "resume"),
-                    ("📄 Peek Last Kata (README/LOG)", "peek_resume"),
                     ("📊 Profile & History", "profile_history"),
                     ("❓ Help & Workflow", "help"),
                     ("🚪 Exit", "exit"),
@@ -2520,8 +2562,6 @@ def handle_menu(_: argparse.Namespace) -> int:
             
         if action == "profile_history":
             handle_history(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
-            console.print()
-            handle_info(argparse.Namespace(notes_root=str(notes_root)))
             
         elif action == "help":
             handle_help(argparse.Namespace())
@@ -2619,13 +2659,6 @@ def handle_menu(_: argparse.Namespace) -> int:
             handle_continue(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
             Prompt.ask("\nPress Enter to return to menu")
 
-        elif action == "peek_resume":
-            if not resume_dir or not resume_dir.exists():
-                console.print("[yellow]No recent kata to preview yet.[/yellow]")
-            else:
-                peek_kata_summary(resume_dir, notes_root)
-            Prompt.ask("\nPress Enter to return to menu")
-
         elif action == "resume":
             if not resume_slug:
                 console.print("[yellow]No recent kata to resume yet. Start a new session first.[/yellow]")
@@ -2635,6 +2668,8 @@ def handle_menu(_: argparse.Namespace) -> int:
                 console.print(f"[red]Last kata '{resume_slug}' not found at {resume_dir}.[/red]")
                 Prompt.ask("\nPress Enter to return to menu")
                 continue
+            # Always show a quick summary before resuming
+            peek_kata_summary(resume_dir, notes_root)
             if Confirm.ask("Run quick test preview before launch?", default=True):
                 passed, summary = quick_check_preview(resume_dir, notes_root)
                 style = "green" if passed else "red"
