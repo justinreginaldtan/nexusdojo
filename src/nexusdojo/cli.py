@@ -1229,19 +1229,11 @@ def summarize_failure_output(output: str, max_lines: int = 20, max_chars: int = 
 
 def is_first_time_user(kata_root: Path, notes_root: Path) -> bool:
     """
-    Determine if the user is brand new (no katas/logs and no tutorial marker).
+    Determine if the tutorial is pending for the current profile.
     """
     current = get_current_profile_name(notes_root) or "default"
     marker = notes_root / f".tutorial_complete.{current}"
-    if marker.exists():
-        return False
-    # Always allow tutorial if it exists and marker not set for this profile
-    if (kata_root / "tutorial-hello").exists():
-        return True
-    # Otherwise check for any activity
-    has_logs = (notes_root / "log.md").exists() and (notes_root / "log.md").stat().st_size > 0
-    has_katas = any((p / "tests").exists() for p in kata_root.iterdir() if p.is_dir())
-    return not has_logs and not has_katas
+    return not marker.exists()
 
 
 def ensure_tutorial_kata(kata_root: Path) -> Path:
@@ -1591,6 +1583,7 @@ def handle_settings(args: argparse.Namespace) -> int:
         ai_mode = settings.get("ai_enabled", True)
         ai_provider = settings.get("ai_provider", "ollama")
         ai_model = settings.get("ai_model", "llama2")
+        remember_user = settings.get("remember_user", False)
 
         console.print(f"[bold]AI Integration:[/bold]")
         console.print(f"  Status: [{'green' if ai_mode else 'red'}]{'Enabled' if ai_mode else 'Disabled'}[/]")
@@ -1598,15 +1591,20 @@ def handle_settings(args: argparse.Namespace) -> int:
         console.print(f"  Model: {ai_model}")
         console.print()
 
+        console.print(f"[bold]Profile:[/bold]")
+        console.print(f"  Remember User: [{'green' if remember_user else 'red'}]{'Enabled' if remember_user else 'Disabled'}[/]")
+        console.print()
+
         # Menu
         console.print("[bold]Options:[/bold]")
         console.print(" [bold cyan]1[/bold cyan] Toggle AI Integration (On/Off)")
         console.print(" [bold cyan]2[/bold cyan] Configure AI Provider")
         console.print(" [bold cyan]3[/bold cyan] Configure AI Model")
-        console.print(" [bold cyan]4[/bold cyan] Return to Menu")
+        console.print(" [bold cyan]4[/bold cyan] Toggle Remember User (Skip Login)")
+        console.print(" [bold cyan]5[/bold cyan] Return to Menu")
         console.print()
 
-        choice = Prompt.ask("[italic grey50]Select option [1-4]:[/italic grey50]", choices=["1", "2", "3", "4"], default="4", show_choices=False)
+        choice = Prompt.ask("[italic grey50]Select option [1-5]:[/italic grey50]", choices=["1", "2", "3", "4", "5"], default="5", show_choices=False)
 
         if choice == "1":
             # Toggle AI
@@ -1653,6 +1651,21 @@ def handle_settings(args: argparse.Namespace) -> int:
             Prompt.ask("Press Enter to continue")
 
         elif choice == "4":
+            # Toggle remember user
+            settings["remember_user"] = not settings.get("remember_user", False)
+            save_settings(notes_root, settings)
+            # Save to default profile file if enabled
+            default_profile_file = notes_root / "default_profile.txt"
+            if settings["remember_user"]:
+                current_profile = get_current_profile_name(notes_root)
+                default_profile_file.write_text(current_profile)
+                console.print(f"\n[green]Remember User enabled. You'll skip the login page next time.[/green]")
+            else:
+                default_profile_file.unlink(missing_ok=True)
+                console.print(f"\n[green]Remember User disabled. You'll see the login page next time.[/green]")
+            Prompt.ask("Press Enter to continue")
+
+        elif choice == "5":
             break
 
     return 0
@@ -3016,13 +3029,6 @@ def handle_menu(_: argparse.Namespace) -> int:
     # Require an active profile before continuing
     ensure_profile_selected(notes_root)
 
-    # First-time tutorial flow (after profile selection)
-    if is_first_time_user(kata_root, notes_root):
-        tutorial_dir = ensure_tutorial_kata(kata_root)
-        console.print("[dim]Launching tutorial...[/dim]")
-        launch_session(tutorial_dir)
-        return 0
-
     while True:
         import time # Import time locally here
         try:
@@ -3115,8 +3121,18 @@ def handle_menu(_: argparse.Namespace) -> int:
             else:
                 resume_label += " (none yet)"
 
+            tutorial_pending = is_first_time_user(kata_root, notes_root)
+
             # --- Menu Options ---
-            if in_kata_context:
+            if tutorial_pending:
+                menu_options = [
+                    ("Start Tutorial", "start_tutorial"),
+                    ("Profile & History", "profile_history"),
+                    ("Help & Workflow", "help"),
+                    ("Settings", "settings"),
+                    ("Exit", "exit"),
+                ]
+            elif in_kata_context:
                 menu_options = [
                     ("Sensei Check (Run Tests)", "check"),
                     ("Sensei Watch Mode", "watch"),
@@ -3152,7 +3168,11 @@ def handle_menu(_: argparse.Namespace) -> int:
             console.print()
 
             for idx, (label, _) in enumerate(menu_options, start=1):
-                console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
+                if idx == 1 and label == "Start Tutorial":
+                    display = f"{idx}) {label} (!)"
+                else:
+                    display = f"{idx}) {label}"
+                console.print(f" [bold cyan]{display}[/bold cyan]")
             
             console.print()
             console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
@@ -3185,13 +3205,17 @@ def handle_menu(_: argparse.Namespace) -> int:
             
         if action == "profile_history":
             handle_history(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
-            Prompt.ask("\nPress Enter to return to menu")
             
         elif action == "help":
             handle_help(argparse.Namespace())
 
         elif action == "settings":
             handle_settings(argparse.Namespace(notes_root=str(notes_root)))
+
+        elif action == "start_tutorial":
+            tutorial_dir = ensure_tutorial_kata(kata_root)
+            console.print("[dim]Launching tutorial...[/dim]")
+            launch_session(tutorial_dir)
 
         elif action == "check":
             target_root = str(active_kata_dir.parent if active_kata_dir else kata_root)
@@ -3619,6 +3643,87 @@ def sanitize_profile_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "", name).strip()
 
 
+def show_login_page(notes_root: Path) -> str:
+    """
+    Display a login/profile selection screen on startup.
+    Returns the selected profile name.
+    """
+    notes_root.mkdir(parents=True, exist_ok=True)
+    profiles_dir = get_profiles_dir(notes_root)
+
+    # Check if user has "remember me" enabled
+    default_profile_file = notes_root / "default_profile.txt"
+    if default_profile_file.exists():
+        remembered = default_profile_file.read_text().strip()
+        if remembered and (profiles_dir / f"{remembered}.json").exists():
+            return remembered
+
+    console.clear()
+    login_panel = Panel(
+        "[bold white]NEXUS DOJO[/bold white]\n"
+        "[dim]Mastery through repetition[/dim]",
+        border_style="blue",
+        padding=(2, 4),
+        title="[bold]Login[/bold]",
+        title_align="center"
+    )
+    console.print(login_panel)
+    console.print()
+
+    existing = list_profiles(notes_root)
+
+    if not existing:
+        # First time user
+        console.print("[bold]Welcome to NexusDojo![/bold]")
+        console.print("[dim]Create your profile to get started.[/dim]\n")
+        name = sanitize_profile_name(Prompt.ask("Profile name", default="engineer"))
+        if not name:
+            name = "engineer"
+        set_current_profile_name(notes_root, name)
+        save_settings(notes_root, {"user_name": name, "remember_user": False})
+        console.print(f"\n[green]✓ Profile '{name}' created![/green]")
+        import time
+        time.sleep(1)
+        return name
+
+    # Existing profiles
+    console.print("[bold]Your Profiles:[/bold]\n")
+    for idx, prof in enumerate(existing, 1):
+        console.print(f"  [bold cyan]{idx}[/bold cyan] {prof}")
+    console.print(f"  [bold cyan]{len(existing) + 1}[/bold cyan] [dim]Create new profile[/dim]")
+    console.print()
+
+    max_choice = len(existing) + 1
+    choice = Prompt.ask(
+        f"Select profile [1-{max_choice}]",
+        choices=[str(i) for i in range(1, max_choice + 1)],
+        default="1",
+        show_choices=False
+    )
+
+    choice_num = int(choice)
+    if choice_num == len(existing) + 1:
+        # Create new
+        console.print()
+        name = sanitize_profile_name(Prompt.ask("Profile name", default="engineer"))
+        if not name:
+            name = "engineer"
+        set_current_profile_name(notes_root, name)
+        save_settings(notes_root, {"user_name": name, "remember_user": False})
+        console.print(f"\n[green]✓ Profile '{name}' created![/green]")
+        import time
+        time.sleep(1)
+        return name
+    else:
+        # Use existing
+        target = existing[choice_num - 1]
+        set_current_profile_name(notes_root, target)
+        console.print(f"\n[green]✓ Logged in as {target}[/green]")
+        import time
+        time.sleep(0.5)
+        return target
+
+
 def ensure_profile_selected(notes_root: Path) -> str:
     """
     Ensure there is an active profile; prompt to create or switch if none.
@@ -3629,40 +3734,8 @@ def ensure_profile_selected(notes_root: Path) -> str:
     if current and (profiles_dir / f"{current}.json").exists():
         return current
 
-    existing = list_profiles(notes_root)
-    console.print(Panel("No active profile found. Create or select a profile to continue.", border_style="cyan"))
-
-    if not existing:
-        name = sanitize_profile_name(Prompt.ask("Enter a profile name", default="engineer"))
-        if not name:
-            name = "engineer"
-        set_current_profile_name(notes_root, name)
-        save_settings(notes_root, {"user_name": name})
-        console.print(f"[green]Profile '{name}' created and set active.[/green]")
-        return name
-
-    console.print("Existing profiles:")
-    for prof in existing:
-        console.print(f" - {prof}")
-    choice = Prompt.ask(
-        "Choose: 1) Create new  2) Use existing",
-        choices=["1", "2"],
-        default="2",
-        show_choices=False,
-    )
-    if choice == "1":
-        name = sanitize_profile_name(Prompt.ask("Enter a profile name", default="engineer"))
-        if not name:
-            name = "engineer"
-        set_current_profile_name(notes_root, name)
-        save_settings(notes_root, {"user_name": name})
-        console.print(f"[green]Profile '{name}' created and set active.[/green]")
-        return name
-    else:
-        target = Prompt.ask("Enter profile name to use", choices=existing, default=existing[0])
-        set_current_profile_name(notes_root, target)
-        console.print(f"[green]Switched to profile '{target}'.[/green]")
-        return target
+    # No active profile, show login page
+    return show_login_page(notes_root)
 
 
 def collect_entries(kata_root: Path, notes_root: Path, since: datetime) -> list[tuple[str, str, str]]:
