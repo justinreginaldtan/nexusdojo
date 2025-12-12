@@ -36,7 +36,7 @@ from . import __version__
 
 # Initialize Rich console
 console = Console()
-console._session_start_time = time.time() # For session timer
+# console._session_start_time = time.time() # For session timer - Temporarily disabled due to issues
 
 # Resolve paths relative to the package installation or repo root
 # If installed in editable mode, this points to the repo root.
@@ -2353,6 +2353,7 @@ def handle_menu(_: argparse.Namespace) -> int:
     force_lobby_view = False
 
     while True:
+        import time # Import time locally here
         try:
             console.clear()
             # Gather context refresh on every loop
@@ -2392,16 +2393,16 @@ def handle_menu(_: argparse.Namespace) -> int:
             # Left Side: User Info, XP, Katas, Streak, Skills
             left = Table.grid(padding=0)
             left.add_row(f"[bold gold1]USER:[/bold gold1] {user_name}")
-            left.add_row(f"[bold]Total XP:[/bold] {total_xp}")
             left.add_row(f"[bold]Completed Katas:[/bold] {completed_drills}")
-            left.add_row("")
-            left.add_row(f"[bold]STREAK:[/bold] {heatmap}")
+            left.add_row(f"[bold]Total XP:[/bold] {total_xp}")
             left.add_row("")
             left.add_row("[bold]SKILL LEVELS:[/bold]")
             for pillar, xp in skills.items():
                 if pillar == "mixed": continue
                 level_title, progress = get_level_info(xp)
                 left.add_row(f"• {format_pillar_label(pillar)}: [white]{level_title}[/white] ([dim]{progress}[/dim])")
+            left.add_row("")
+            left.add_row(f"[bold]STREAK:[/bold] {heatmap}")
             left.add_row("")
             left.add_row(f"[dim]Next Goal: {format_pillar_label(weakest_pillar)} ({weakest_level})[/dim]") # Keep a tiny nudge
 
