@@ -23,3 +23,4 @@ Third Branch (Just in case)
 Features I want to implement
 1. some notes shortcut where i type notes in terminal, and it opens up my notes i plan to store like in here or something.
 2. similar function as above, but with a daily recap thing, to embrace the mindset of "proof of work > effort"
+3. https://mcpmarket.com/server/model-context-protocol-for-beginners

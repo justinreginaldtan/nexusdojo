@@ -25,20 +25,35 @@ from rich.table import Table
 from rich import box
 from rich.prompt import Prompt, Confirm
 from rich.markdown import Markdown
+from rich.align import Align
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.text import Text
+from rich.tree import Tree
+from rich.syntax import Syntax
 
 from . import __version__
 
 # Initialize Rich console
 console = Console()
+console._session_start_time = time.time() # For session timer
+
+# Resolve paths relative to the package installation or repo root
+# If installed in editable mode, this points to the repo root.
+# __file__ is src/nexusdojo/cli.py
+# parents[0] = src/nexusdojo
+# parents[1] = src
+# parents[2] = repo_root
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Default workspace location for local knowledge artifacts.
-DEFAULT_WORKSPACE = Path("./nexusdojo_data")
+DEFAULT_WORKSPACE = REPO_ROOT / "nexusdojo_data"
 # Default root for dojo katas.
-DEFAULT_KATA_ROOT = Path("./dojo")
+DEFAULT_KATA_ROOT = REPO_ROOT / "dojo"
 # Default root for notes and briefs.
-DEFAULT_NOTES_ROOT = Path("./notes")
+DEFAULT_NOTES_ROOT = REPO_ROOT / "notes"
 # Location of bundled templates (relative to repo root).
-TEMPLATES_ROOT = Path(__file__).resolve().parents[2] / "templates"
+TEMPLATES_ROOT = REPO_ROOT / "templates"
 # Default model settings for idea generation.
 DEFAULT_IDEA_PROVIDER = "ollama"
 DEFAULT_IDEA_MODEL = "qwen2.5-coder:1.5b"
@@ -533,6 +548,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_NOTES_ROOT),
         help="Directory for shared notes/logs.",
     )
+    watch_parser.add_argument(
+        "--countdown-minutes",
+        type=int,
+        help="Start a Pomodoro countdown in watch mode (e.g., 25).",
+    )
     watch_parser.set_defaults(func=handle_watch)
 
     play_parser = subparsers.add_parser(
@@ -569,11 +589,15 @@ def build_parser() -> argparse.ArgumentParser:
 def handle_watch(args: argparse.Namespace) -> int:
     """
     Watch for file changes and auto-run dojo check.
+    Includes an optional Pomodoro timer.
     """
     import time
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 
+    # Get countdown minutes from args, default to None (no timer)
+    countdown_minutes = getattr(args, "countdown_minutes", None)
+    
     kata_root = Path(args.root).expanduser()
     if args.project:
         project_dir = kata_root / args.project
@@ -585,6 +609,7 @@ def handle_watch(args: argparse.Namespace) -> int:
         return 1
 
     start_time = time.time()
+    timer_end_time = (start_time + countdown_minutes * 60) if countdown_minutes else None
 
     console.print(Panel(
         f"Watching [cyan]{project_dir}[/cyan]\n"
@@ -594,6 +619,13 @@ def handle_watch(args: argparse.Namespace) -> int:
         border_style="blue"
     ))
 
+    def play_system_sound():
+        # Play a simple beep on macOS, fall back to print
+        try:
+            subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], check=True, stderr=subprocess.PIPE)
+        except Exception:
+            console.print("[bold yellow]🔔 Pomodoro Time's Up! 🔔[/bold yellow]", style="blink")
+
     class TestRunnerHandler(FileSystemEventHandler):
         def on_modified(self, event):
             if event.src_path.endswith(".py"):
@@ -601,15 +633,19 @@ def handle_watch(args: argparse.Namespace) -> int:
                 time.sleep(0.1)
                 console.clear()
                 
-                elapsed = int(time.time() - start_time)
-                mins, secs = divmod(elapsed, 60)
-                timer_str = f"{mins:02}:{secs:02}"
+                # --- Timer Display ---
+                elapsed_display = int(time.time() - start_time)
+                mins, secs = divmod(elapsed_display, 60)
+                elapsed_str = f"Elapsed: {mins:02}:{secs:02}"
                 
-                console.print(Panel(
-                    f"[bold]FOCUS TIMER:[/bold] [cyan]{timer_str}[/cyan]",
-                    box=box.MINIMAL,
-                    style="dim"
-                ))
+                timer_status_str = f"[bold]FOCUS TIMER:[/bold] [cyan]{elapsed_str}[/cyan]"
+                if timer_end_time:
+                    remaining_seconds = max(0, int(timer_end_time - time.time()))
+                    rem_mins, rem_secs = divmod(remaining_seconds, 60)
+                    timer_status_str += f" [bold red]Remaining: {rem_mins:02}:{rem_secs:02}[/bold red]"
+                
+                console.print(Panel(timer_status_str, box=box.MINIMAL, style="dim"))
+                # --- End Timer Display ---
                 
                 console.print(f"[dim]Change detected in {Path(event.src_path).name}...[/dim]")
                 # We call handle_check but suppress the return code to keep watching
@@ -627,8 +663,25 @@ def handle_watch(args: argparse.Namespace) -> int:
     observer.start()
 
     try:
-        while True:
-            time.sleep(1)
+        if timer_end_time:
+            # Main loop for countdown
+            while time.time() < timer_end_time:
+                time.sleep(1)
+            console.clear()
+            console.print(Panel(
+                "[bold green]🔔 Pomodoro Session Ended! 🔔[/bold green]\n"
+                "Time for a break, Reginald.",
+                title="⏱️ SESSION COMPLETE",
+                border_style="green",
+                box=box.DOUBLE
+            ))
+            play_system_sound()
+            # If timer ends, stop watching
+            observer.stop()
+        else:
+            # No timer, just watch indefinitely
+            while True:
+                time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
         console.print("\n[blue]Watch stopped.[/blue]")
@@ -732,18 +785,20 @@ def handle_check(args: argparse.Namespace) -> int:
 
     else:
         # Failure Case
+        error_out = result.stderr or result.stdout
+        
+        # Truncate if huge
+        if len(error_out) > 2000:
+            error_disp = error_out[:2000] + "\n... (truncated)"
+        else:
+            error_disp = error_out
+
         console.print(Panel(
-            "[bold red]TESTS FAILED[/bold red]",
-            title="❌ SYSTEM ALERT",
+            f"[white]{error_disp.strip()}[/white]",
+            title="[bold red]❌ TESTS FAILED[/bold red]",
             border_style="red",
             box=box.HEAVY
         ))
-        error_out = result.stderr or result.stdout
-        if getattr(args, "truncate_output", False):
-            console.print(f"[dim]{summarize_failure_output(error_out)}[/dim]")
-            console.print("[dim]Run full `dojo check` for complete output.[/dim]")
-        else:
-            console.print(f"[dim]{error_out.strip()}[/dim]")
         
         console.print("\n[bold yellow]Analyzing failure...[/bold yellow]")
         
@@ -903,14 +958,21 @@ def generate_mission_spec(
     if not offline:
         content = call_idea_api(DEFAULT_IDEA_PROVIDER, DEFAULT_IDEA_MODEL, messages)
         if content:
+            text = content.strip()
+            if "{" in text and "}" in text:
+                start = text.find("{")
+                end = text.rfind("}")
+                if start != -1 and end != -1:
+                    text = text[start : end + 1]
             try:
-                spec_json = json.loads(content)
+                spec_json = json.loads(text)
             except json.JSONDecodeError:
-                console.print(f"[red]Error parsing mission spec JSON:[/red] {content[:200]}...", file=sys.stderr)
+                preview = (text or content or "")[:200]
+                print(f"Error parsing mission spec JSON: {preview}...", file=sys.stderr)
 
     if not spec_json:
         fallback_used = True
-        console.print("[yellow]LLM failed to generate mission spec; using deterministic fallback.[/yellow]", file=sys.stderr)
+        print("LLM failed to generate mission spec; using deterministic fallback.", file=sys.stderr)
         spec_json = {
             "goal": f"Implement a {idea_title} based on standard Python practices.",
             "inputs": ["Varies by project idea."],
@@ -1116,14 +1178,18 @@ def run_onboarding(notes_root: Path) -> int:
     console.print("Your goal is to reach [bold]Master[/bold] rank. To do that, you must train.")
     console.print("Here is the recommended workflow:\n")
     
-    guide = """
-    1. **⚡ Quick Train:** The AI picks a drill for your weakest skill.
-    2. **📜 Mission:** Read `MISSION.md` (Your ticket).
-    3. **👀 Watch:** Run `dojo watch` to auto-test your code.
-    4. **⌨️  Code:** Solve the problem.
-    5. **✅ Log:** Rate difficulty to gain XP.
-    """
-    console.print(Markdown(guide))
+    # Use a Grid for precise control instead of Markdown list
+    wf_grid = Table.grid(padding=(0, 1))
+    wf_grid.add_column(justify="right", style="cyan bold")
+    wf_grid.add_column()
+    
+    wf_grid.add_row("1.", "⚡ [bold]Quick Train:[/bold] The AI picks a drill for your weakest skill.")
+    wf_grid.add_row("2.", "📜 [bold]Mission:[/bold] Read `MISSION.md` (Your ticket).")
+    wf_grid.add_row("3.", "👀 [bold]Watch:[/bold] Run `dojo watch` to auto-test your code.")
+    wf_grid.add_row("4.", "⌨️ [bold]Code:[/bold] Solve the problem.")
+    wf_grid.add_row("5.", "✅ [bold]Log:[/bold] Rate difficulty to gain XP.")
+    
+    console.print(wf_grid)
     
     Prompt.ask("\nPress Enter to enter the Dojo")
     
@@ -1229,7 +1295,7 @@ def handle_start(args: argparse.Namespace) -> int:
 
     prompt_user = (args.guided or not idea) and interactive
     if args.reuse_settings and not stored_settings and prompt_user:
-        console.print("[yellow]No saved settings found; switching to guided prompts.[/yellow]", file=sys.stderr)
+        print("No saved settings found; switching to guided prompts.", file=sys.stderr)
         args.reuse_settings = False
 
     if prompt_user and not args.reuse_settings:
@@ -1275,7 +1341,7 @@ def handle_start(args: argparse.Namespace) -> int:
         selected_idea: Optional[str] = None
         if prompt_user and not args.yes:
             if offline_mode:
-                console.print("[yellow]Offline mode: skipping model calls for ideas.[/yellow]", file=sys.stderr)
+                print("Offline mode: skipping model calls for ideas.", file=sys.stderr)
             with console.status("[bold green]Picking kata idea...[/bold green]", spinner="dots"):
                 options, options_fallback = pick_idea_options(
                     provider=DEFAULT_IDEA_PROVIDER,
@@ -1312,9 +1378,9 @@ def handle_start(args: argparse.Namespace) -> int:
                     choice_idx = max(1, min(choice_idx, len(options)))
                     selected_idea = normalize_idea_line(options[choice_idx - 1])
                 if options_fallback:
-                    console.print("[yellow]Note: LLM idea picker unavailable; used curated options.[/yellow]", file=sys.stderr)
+                    print("Note: LLM idea picker unavailable; used curated options.", file=sys.stderr)
         if not selected_idea:
-            console.print("[yellow]No idea provided; using adaptive idea picker...[/yellow]", file=sys.stderr)
+            print("No idea provided; using adaptive idea picker...", file=sys.stderr)
             with console.status("[bold green]Generating idea...[/bold green]", spinner="dots"):
                 picked, used_fallback = pick_idea_with_hints(
                     provider=DEFAULT_IDEA_PROVIDER,
@@ -1327,18 +1393,18 @@ def handle_start(args: argparse.Namespace) -> int:
                     offline=offline_mode,
                 )
             if not picked:
-                console.print("[yellow]Idea picker failed; using curated fallback.[/yellow]", file=sys.stderr)
+                print("Idea picker failed; using curated fallback.", file=sys.stderr)
                 picked = fallback_idea(
                     pillar_hint=pillar_hint,
                     level_hint=level_hint,
                     mode_hint=mode_hint,
                 )
             if not picked:
-                console.print("[red]Unable to generate an idea. Please provide one manually.[/red]", file=sys.stderr)
+                print("Unable to generate an idea. Please provide one manually.", file=sys.stderr)
                 return 1
             selected_idea = normalize_idea_line(picked)
             if used_fallback:
-                console.print("[yellow]Note: LLM idea picker unavailable; used curated fallback.[/yellow]", file=sys.stderr)
+                print("Note: LLM idea picker unavailable; used curated fallback.", file=sys.stderr)
         idea = selected_idea
 
     idea_line = normalize_idea_line(idea)
@@ -1346,7 +1412,7 @@ def handle_start(args: argparse.Namespace) -> int:
     slug_base = slugify(idea_title)
     slug = slug_base
     if not slug:
-        console.print("[red]Idea is empty after slugifying; provide a short description.[/red]", file=sys.stderr)
+        print("Idea is empty after slugifying; provide a short description.", file=sys.stderr)
         return 1
 
     kata_root.mkdir(parents=True, exist_ok=True)
@@ -1373,7 +1439,7 @@ def handle_start(args: argparse.Namespace) -> int:
 
     template_dir = TEMPLATES_ROOT / resolved_template
     if not template_dir.exists():
-        console.print(f"[red]Template not found: {template_dir}[/red]", file=sys.stderr)
+        print(f"Template not found: {template_dir}", file=sys.stderr)
         return 1
 
     shutil.copytree(template_dir, target_dir, dirs_exist_ok=args.force)
@@ -1417,7 +1483,7 @@ def handle_start(args: argparse.Namespace) -> int:
     )
     console.print(f"Generated [green]MISSION.md[/green] and [green]test_mission.py[/green] for: [bold]{idea_title}[/bold]")
     if fallback_used_mission:
-        console.print("[yellow]Note: LLM unavailable for mission spec; using curated fallback.[/yellow]", file=sys.stderr)
+        print("Note: LLM unavailable for mission spec; using curated fallback.", file=sys.stderr)
 
     # Mission Injection Logic
     docstring_mission = "\n".join([line for line in mission_md_content.splitlines() if not line.startswith("# Mission")])
@@ -1431,10 +1497,11 @@ def handle_start(args: argparse.Namespace) -> int:
         main_py = target_dir / "main.py"
         if main_py.exists():
             original_content = main_py.read_text()
-            # Remove existing generic docstring if present
-            if original_content.startswith('"""Auto-generated'):
-                _, original_content = original_content.split('"""', 2)[2:]
-                original_content = original_content.lstrip()
+            # Remove any leading docstring to avoid double mission headers
+            if original_content.startswith('"""'):
+                end_idx = original_content.find('"""', 3)
+                if end_idx != -1:
+                    original_content = original_content[end_idx + 3 :].lstrip()
             
             main_py.write_text(mission_header + original_content)
 
@@ -1450,11 +1517,24 @@ def handle_start(args: argparse.Namespace) -> int:
     if effective_tests_pref != "skip":
         seed_test_scaffold(target_dir, resolved_template, idea_line, include_edge=(effective_tests_pref == "edge"))
 
+    # Show Tree
+    tree = Tree(f"📂 [bold green]{target_dir.name}[/bold green]")
+    tree.add("📜 MISSION.md")
+    tree.add("🐍 main.py")
+    tests_node = tree.add("📂 tests")
+    tests_node.add("🐍 __init__.py")
+    if effective_tests_pref != "skip":
+        tests_node.add("🐍 test_smoke.py")
+        if effective_tests_pref == "edge":
+            tests_node.add("🐍 test_edge_cases.py")
+    
+    console.print(Panel(tree, title="Scaffold Generated", border_style="green"))
+
     console.print(f"Created kata at [green]{target_dir}[/green]")
     if scaffolded:
         console.print("[green]Scaffolded: kata.md, stubs, and focused tests generated.[/green]")
         if fallback_used_scaffold:
-            console.print("[yellow]Note: LLM scaffold unavailable; used deterministic fallback.[/yellow]", file=sys.stderr)
+            print("Note: LLM scaffold unavailable; used deterministic fallback.", file=sys.stderr)
     if effective_tests_pref != "skip":
         console.print("[green]Tests seeded: Run `dojo check` to verify.[/green]")
     
@@ -1504,13 +1584,31 @@ def launch_session(project_dir: Path) -> None:
     # Check for TMUX
     in_tmux = os.environ.get("TMUX") is not None
     
+    # Pomodoro prompt
+    countdown_minutes = None
+    if in_tmux: # Only ask for pomodoro if we can do the split pane experience
+        pomodoro_choice = Prompt.ask("Start Pomodoro session? (25 min) [y/n]", choices=["y", "n"], default="y")
+        if pomodoro_choice.lower() == "y":
+            countdown_minutes = 25
+
     if in_tmux:
         console.print("[green]Tmux detected. Configuring split-pane environment...[/green]")
+        
+        # Build the command for the new pane (dojo watch)
+        watch_cmd_parts = [
+            sys.executable, "-m", "nexusdojo.cli", "watch",
+            "--project", project_dir.name,
+            "--root", str(project_dir.parent),
+            "--notes-root", str(DEFAULT_NOTES_ROOT)
+        ]
+        if countdown_minutes:
+            watch_cmd_parts.extend(["--countdown-minutes", str(countdown_minutes)])
+
         # 1. Split window horizontally, cd to project, run dojo watch
         subprocess.run([
             "tmux", "split-window", "-h", 
             "-c", str(project_dir), 
-            f"{sys.executable} -m nexusdojo.cli watch"
+            " ".join(watch_cmd_parts) # Pass as a single string for tmux
         ])
         
         # 2. Open nvim in the current pane
@@ -1522,15 +1620,16 @@ def launch_session(project_dir: Path) -> None:
         
         # Use execvp to replace the python process with nvim
         # We open MISSION.md (read-only reference) and main.py (to edit)
-        # -O opens in vertical splits inside nvim, or just open files as buffers
-        # Let's just open main.py and MISSION.md as buffers.
         os.execvp("nvim", ["nvim", "main.py", "MISSION.md"])
         
     else:
         console.print("[yellow]Tip: Run 'dojo menu' inside tmux for auto-split 'Watch Mode'.[/yellow]")
-        console.print("[dim]Launching Neovim...[/dim]")
+        if countdown_minutes:
+            console.print("[red]Pomodoro timer requires Watch Mode, which is best in tmux.[/red]")
+            console.print("[dim]Launching Neovim without timer...[/dim]")
+        else:
+            console.print("[dim]Launching Neovim...[/dim]")
         os.chdir(project_dir)
-        # Just launch nvim
         subprocess.run(["nvim", "main.py", "MISSION.md"])
 
 
@@ -2009,8 +2108,12 @@ def handle_hint(args: argparse.Namespace) -> int:
     if args.offline or fallback_used:
         label += " [offline fallback]"
     quota_line = f"(remaining today: {remaining})" if remaining is not None else ""
-    print(f"{label} {quota_line}".strip())
-    print(hint.strip())
+    
+    console.print(Panel(
+        Markdown(hint),
+        title=f"💡 {label} {quota_line}",
+        border_style="yellow"
+    ))
     return 0
 
 
@@ -2057,7 +2160,7 @@ def handle_test_hints(args: argparse.Namespace) -> int:
     return 0
 
 
-def get_streak_heatmap(notes_root: Path, days: int = 5) -> str:
+def get_streak_heatmap(notes_root: Path, days: int = 7) -> str:
     """
     Generate a simple ASCII heatmap of recent activity.
     """
@@ -2085,178 +2188,328 @@ def get_streak_heatmap(notes_root: Path, days: int = 5) -> str:
     return " ".join(heatmap)
 
 
-def handle_history(args: argparse.Namespace) -> int:
+def find_active_kata_dir(cwd: Path) -> Optional[Path]:
     """
-    Display a scrollable history of completed katas from the log.
+    Check if cwd or parents is a kata directory (has .kata.json or MISSION.md).
     """
-    kata_root = Path(args.root).expanduser()
-    notes_root = Path(args.notes_root).expanduser()
-    
-    # Collect all entries since forever (datetime.min)
-    entries = collect_entries(kata_root, notes_root, datetime.min)
-    
-    if not entries:
-        console.print("[yellow]No history found. Complete a kata to see it here![/yellow]")
-        return 0
-        
-    table = Table(title="📜 Kata History", box=box.SIMPLE, show_lines=True)
-    table.add_column("Date", style="cyan", no_wrap=True)
-    table.add_column("Project", style="green")
-    table.add_column("Notes", style="white")
-    
-    # Sort reverse chronological
-    for project, ts, note in sorted(entries, key=lambda x: x[1], reverse=True):
-        table.add_row(ts, project, note)
-        
-    console.print(table)
-    return 0
-
-
-def find_active_kata_dir(start: Path) -> Optional[Path]:
-    """
-    Walk upward from start to find the nearest kata folder (MISSION.md present).
-    """
-    for candidate in [start] + list(start.parents):
-        if (candidate / "MISSION.md").exists():
-            return candidate
+    # Check current first
+    if (cwd / ".kata.json").exists() or (cwd / "MISSION.md").exists():
+        return cwd
+    # Check parents until we hit a known root or too far
+    for parent in cwd.parents:
+        if (parent / ".kata.json").exists():
+            return parent
+        if parent.name == "dojo" and (parent / cwd.name).exists():
+             # If we are in dojo/kata-name/subdir
+             return parent / cwd.name
     return None
 
+def format_pillar_label(pillar: str) -> str:
+    return pillar.title()
+
+def count_completed_drills(kata_root: Path, notes_root: Path) -> int:
+    # Estimate based on unique projects in log or folders in dojo
+    # Log is better for completed
+    entries = collect_entries(kata_root, notes_root, datetime.min)
+    unique_projects = {e[0] for e in entries}
+    return len(unique_projects)
 
 def resolve_last_kata(kata_root: Path, notes_root: Path) -> tuple[Optional[str], Optional[Path]]:
-    """
-    Determine the last active kata slug and its directory (if it still exists).
-    """
     recent = latest_activity(kata_root, notes_root)
     if not recent:
-        return None, None
+        # Fallback to finding newest directory in kata_root
+        newest_project: Optional[str] = None
+        newest_path: Optional[Path] = None
+        newest_ts: Optional[datetime] = None
+        if kata_root.exists():
+            for project_dir in kata_root.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                meta_ts: Optional[datetime] = None
+                meta_path = project_dir / ".kata.json"
+                if meta_path.exists():
+                    try:
+                        meta = json.loads(meta_path.read_text())
+                        meta_ts = datetime.fromisoformat(meta.get("created_at", ""))
+                    except Exception:
+                        meta_ts = None
+                if meta_ts is None:
+                    meta_ts = datetime.fromtimestamp(project_dir.stat().st_mtime)
+                if newest_ts is None or meta_ts > newest_ts:
+                    newest_ts = meta_ts
+                    newest_project = project_dir.name
+                    newest_path = project_dir
+        return newest_project, newest_path
     project = recent[0]
     target_dir = kata_root / project
     return project, target_dir if target_dir.exists() else None
+
+def peek_kata_summary(kata_dir: Path, notes_root: Path) -> None:
+    # 1. File Tree
+    tree = Tree(f"📂 [bold cyan]{kata_dir.name}[/bold cyan]")
+    for path in sorted(kata_dir.rglob("*")):
+        if path.name.startswith("."): continue
+        if path.is_dir():
+            # Simply showing top level structure for clarity
+            continue 
+        
+        # relative path
+        rel = path.relative_to(kata_dir)
+        # Add to tree (simplified flat add for now, or recursive if we want)
+        # Let's keep it simple: just show direct children and tests
+        if len(rel.parts) > 2: continue # Don't go too deep
+        
+        icon = "📄"
+        if path.suffix == ".py": icon = "🐍"
+        if path.name == "MISSION.md": icon = "📜"
+        if path.name == "README.md": icon = "📖"
+        
+        tree.add(f"{icon} {rel}")
+
+    # 2. Content Preview
+    readme = kata_dir / "README.md"
+    mission = kata_dir / "MISSION.md"
+    
+    content_render = None
+    if mission.exists():
+        content_render = Markdown(mission.read_text())
+        title = "MISSION.md"
+    elif readme.exists():
+        content_render = Markdown(readme.read_text())
+        title = "README.md"
+    else:
+        content_render = Text("No documentation found.", style="italic dim")
+        title = "Info"
+
+    # Layout
+    console.print(Panel(tree, title="Architecture", border_style="blue"))
+    console.print(Panel(content_render, title=f"Preview: {title}", border_style="cyan"))
+
+def quick_check_preview(kata_dir: Path, notes_root: Path) -> tuple[bool, str]:
+    import subprocess
+    if not (kata_dir / "tests").exists():
+        return False, "No tests found."
+    
+    try:
+        # Run tests silently
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest"],
+            cwd=kata_dir,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            return True, "All tests passed."
+        else:
+            # Count failures
+            count = result.stderr.count("FAIL") + result.stderr.count("ERROR")
+            return False, f"Tests failed ({count} errors/failures)."
+    except subprocess.TimeoutExpired:
+        return False, "Tests timed out."
+    except Exception as e:
+        return False, f"Error running tests: {e}"
+
+
+
+def render_progress_bar(current: int, total: int, width: int = 20) -> str:
+    """
+    Renders a static progress bar string.
+    """
+    if total == 0: total = 100 # Avoid div by zero
+    percent = min(1.0, current / total)
+    filled = int(width * percent)
+    empty = width - filled
+    
+    # Color grading based on percentage
+    color = "red"
+    if percent > 0.33: color = "yellow"
+    if percent > 0.66: color = "green"
+    if percent >= 1.0: color = "cyan"
+    
+    bar = f"[{color}]{'━' * filled}[/{color}]{'[dim]━[/dim]' * empty}"
+    return bar
+
+def get_next_level_threshold(xp: int) -> int:
+    # Matches get_level_info logic
+    if xp < 100: return 100
+    if xp < 300: return 300
+    if xp < 600: return 600
+    if xp < 1000: return 1000
+    return 9999
 
 
 def handle_menu(_: argparse.Namespace) -> int:
     """
     Interactive menu for common tasks (Rich UI).
     """
-    kata_root = Path(DEFAULT_KATA_ROOT).expanduser()
-    notes_root = Path(DEFAULT_NOTES_ROOT).expanduser()
-    notes_root.mkdir(parents=True, exist_ok=True) # Ensure notes dir exists
+    kata_root = Path(DEFAULT_KATA_ROOT)
+    notes_root = Path(DEFAULT_NOTES_ROOT)
+    notes_root.mkdir(parents=True, exist_ok=True) 
     
-    # --- Onboarding Check ---
     if not (notes_root / "skills.json").exists():
         return run_onboarding(notes_root)
 
     force_lobby_view = False
 
     while True:
-        console.clear()
-        # Gather context refresh on every loop
-        active_kata_dir = find_active_kata_dir(Path.cwd())
-        in_kata_context = active_kata_dir is not None and not force_lobby_view
-
-        skills = load_skills(notes_root)
-        settings = load_settings(notes_root)
-        user_name = settings.get("user_name", "Engineer")
-        recent_entries = collect_entries(kata_root, notes_root, datetime.min)
-        
-        # Format Skills for Dashboard
-        skill_summary = []
-        for pillar, xp in skills.items():
-            if pillar == "mixed": continue
-            title, progress = get_level_info(xp)
-            skill_summary.append(f"{format_pillar_label(pillar)}: [bold]{title}[/bold] ({progress})")
-        
-        valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
-        weakest_pillar = min(valid_skills, key=valid_skills.get) if valid_skills else "python"
-        
-        # Calculate Total Stats
-        total_xp = sum(v for k, v in skills.items() if k != "mixed")
-        completed_drills = count_completed_drills(kata_root, notes_root)
-        
-        heatmap = get_streak_heatmap(notes_root)
-        resume_slug, resume_dir = resolve_last_kata(kata_root, notes_root)
-        resume_label = "▶️  Resume Last Kata"
-        if resume_slug:
-            resume_label = f"▶️  Resume Last Kata: {resume_slug}"
-        else:
-            resume_label += " (none yet)"
-
-        context_line = "[bold]Context:[/bold] Lobby (no kata detected here)"
-        if active_kata_dir:
-            kata_label = f"Kata detected: {active_kata_dir.name} ({active_kata_dir.resolve()})"
-            context_line = f"[bold]Context:[/bold] {kata_label}" if in_kata_context else f"[bold]Context:[/bold] Lobby view - {kata_label}"
-
-        # Recent history (last 3 entries)
-        recent_block = "No history yet."
-        if recent_entries:
-            tail = recent_entries[-3:]
-            recent_lines = [f"{proj} @ {ts}: {note}" for proj, ts, note in tail]
-            recent_block = "\n".join(recent_lines)
-        
-        # --- Dashboard Header ---
-        dashboard_text = (
-            f"[bold gold1]Welcome back, {user_name}.[/bold gold1]\n\n"
-            f"[bold]Skill Profile:[/bold]\n" + "\n".join(f"• {s}" for s in skill_summary) + "\n\n"
-            f"[bold]Focus:[/bold] {format_pillar_label(weakest_pillar)} (Weakest)\n"
-            f"[bold]Total XP:[/bold] {total_xp}   [bold]Completed Drills:[/bold] {completed_drills}\n"
-            f"[bold]Consistency:[/bold] {heatmap} (Last 5 Days)\n"
-            f"{context_line}\n"
-            f"[bold]Recent activity:[/bold]\n{recent_block}"
-        )
-        
-        panel = Panel(
-            dashboard_text,
-            title="[bold white]NEXUS DOJO[/bold white]",
-            subtitle="[italic grey62]Mastery through repetition[/italic grey62]",
-            border_style="blue",
-            box=box.ROUNDED,
-            padding=(1, 2)
-        )
-        console.print(panel)
-        console.print()
-
-        # --- Menu Options ---
-        if in_kata_context:
-            menu_options = [
-                ("✅ Sensei Check (Run Tests)", "check"),
-                ("👀 Sensei Watch Mode", "watch"),
-                ("💡 Get Unstuck (Hint)", "hint"),
-                ("📄 Peek This Kata (README/LOG)", "peek_current"),
-                ("🧹 Reset Kata", "reset_kata"),
-                ("🧠 Request Solution (Zero XP)", "solve_kata"),
-                ("🔙 Return to Lobby Menu", "return_lobby"),
-            ]
-        else:
-            menu_options = [
-                ("⚡ Quick Train (AI-Guided)", "quick_train"),
-                ("🚀 Start New Session (Manual)", "start_auto"),
-                (resume_label, "resume"),
-                ("📄 Peek Last Kata (README/LOG)", "peek_resume"),
-                ("📊 Profile & History", "profile_history"),
-                ("❓ Help & Workflow", "help"),
-                ("🚪 Exit", "exit"),
-            ]
-            if force_lobby_view and active_kata_dir:
-                menu_options.insert(-1, ("⬅️ Back to Kata Tools", "back_to_kata"))
-
-        for idx, (label, _) in enumerate(menu_options, start=1):
-            console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
-        
-        console.print()
-        console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
-        
-        choice = input().strip()
-        
-        # Map input to action
         try:
-            idx = int(choice)
-            if 1 <= idx <= len(menu_options):
-                action = menu_options[idx - 1][1]
+            console.clear()
+            # Gather context refresh on every loop
+            active_kata_dir = find_active_kata_dir(Path.cwd())
+            in_kata_context = active_kata_dir is not None and not force_lobby_view
+
+            skills = load_skills(notes_root)
+            settings = load_settings(notes_root)
+            user_name = settings.get("user_name", "Engineer")
+            recent_entries = collect_entries(kata_root, notes_root, datetime.min)
+            
+            valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
+            
+            # Calculate derived stats
+            total_xp = sum(v for k, v in valid_skills.items())
+            completed_drills = count_completed_drills(kata_root, notes_root)
+            heatmap = get_streak_heatmap(notes_root, days=7)
+            
+            # Determine highest and weakest pillar for Focus Highlight
+            if valid_skills:
+                strongest_pillar = max(valid_skills, key=valid_skills.get)
+                weakest_pillar = min(valid_skills, key=valid_skills.get)
+            else: # Default for brand new users
+                strongest_pillar = "python"
+                weakest_pillar = "python"
+            
+            strongest_level, _ = get_level_info(skills.get(strongest_pillar, 0))
+            weakest_level, _ = get_level_info(skills.get(weakest_pillar, 0))
+
+
+            # --- Dashboard Layout (Focus Highlight) ---
+            
+            top_grid = Table.grid(expand=True, padding=(0, 1))
+            top_grid.add_column(ratio=1) # Left: User Info, Focus
+            top_grid.add_column(ratio=1) # Right: Context, Logs, Skills
+            
+            # Left Side: User Info, XP, Katas, Streak, Skills
+            left = Table.grid(padding=0)
+            left.add_row(f"[bold gold1]USER:[/bold gold1] {user_name}")
+            left.add_row(f"[bold]Total XP:[/bold] {total_xp}")
+            left.add_row(f"[bold]Completed Katas:[/bold] {completed_drills}")
+            left.add_row("")
+            left.add_row(f"[bold]STREAK:[/bold] {heatmap}")
+            left.add_row("")
+            left.add_row("[bold]SKILL LEVELS:[/bold]")
+            for pillar, xp in skills.items():
+                if pillar == "mixed": continue
+                level_title, progress = get_level_info(xp)
+                left.add_row(f"• {format_pillar_label(pillar)}: [white]{level_title}[/white] ([dim]{progress}[/dim])")
+            left.add_row("")
+            left.add_row(f"[dim]Next Goal: {format_pillar_label(weakest_pillar)} ({weakest_level})[/dim]") # Keep a tiny nudge
+
+            # Right Side: Context, Logs
+            right = Table.grid(padding=0)
+            
+            # Active Context
+            if active_kata_dir:
+                status_color = "green" if in_kata_context else "dim"
+                right.add_row(f"[bold]ACTIVE CONTEXT:[/bold] [{status_color}]{active_kata_dir.name}[/{status_color}]")
             else:
-                console.print("[red]Invalid selection.[/red]")
-                import time; time.sleep(1)
+                right.add_row("[bold]ACTIVE CONTEXT:[/bold] [dim]Lobby[/dim]")
+            
+            right.add_row("")
+            right.add_row("[bold]RECENT ACTIVITY:[/bold]")
+            if recent_entries:
+                tail = recent_entries[-3:]
+                for proj, ts, note in tail:
+                    right.add_row(f"[dim]• {proj} ({ts.split(' ')[0]}): {summarize_text(note, 30)}[/dim]")
+            else:
+                right.add_row("[dim]• No recent logs.[/dim]")
+
+            top_grid.add_row(left, right)
+
+            # Footer
+            footer_text = f"\"Simplicity is the soul of efficiency.\" - Austin Freeman" # Placeholder, later from a list
+            
+            # Combine
+            main_layout = Table.grid(expand=True)
+            main_layout.add_row(top_grid)
+            main_layout.add_row("") # Spacer
+            main_layout.add_row(Align.center(f"[dim]{footer_text}[/dim]")) # Centered Quote
+
+
+            resume_slug, resume_dir = resolve_last_kata(kata_root, notes_root)
+            resume_label = "▶️ Resume Last Kata"
+            if resume_slug:
+                resume_label = f"▶️ Resume Last Kata ({resume_slug})"
+            else:
+                resume_label += " (none yet)"
+
+            # --- Menu Options ---
+            if in_kata_context:
+                menu_options = [
+                    ("✅ Sensei Check (Run Tests)", "check"),
+                    ("👀 Sensei Watch Mode", "watch"),
+                    ("💡 Get Unstuck (Hint)", "hint"),
+                    ("📄 Peek This Kata (README/LOG)", "peek_current"),
+                    ("🧹 Reset Kata", "reset_kata"),
+                    ("🧠 Request Solution (Zero XP)", "solve_kata"),
+                    ("🔙 Return to Lobby Menu", "return_lobby"),
+                ]
+            else:
+                menu_options = [
+                    ("⚡ Quick Train (AI-Guided)", "quick_train"),
+                    ("🚀 Start New Session (Manual)", "start_auto"),
+                    (resume_label, "resume"),
+                    ("📄 Peek Last Kata (README/LOG)", "peek_resume"),
+                    ("📊 Profile & History", "profile_history"),
+                    ("❓ Help & Workflow", "help"),
+                    ("🚪 Exit", "exit"),
+                ]
+                if force_lobby_view and active_kata_dir:
+                    menu_options.insert(-1, ("⬅️ Back to Kata Tools", "back_to_kata"))
+
+            # Render Panel
+            # Get session time for header
+            session_start_time = getattr(console, "_session_start_time", time.time())
+            elapsed_seconds = int(time.time() - session_start_time)
+            session_mins, session_secs = divmod(elapsed_seconds, 60)
+            session_header = f"[Session: {session_mins:02}:{session_secs:02}]"
+
+            panel = Panel(
+                main_layout,
+                title="[bold white]NEXUS DOJO[/bold white]",
+                subtitle=f"[italic grey62]Mastery through repetition[/italic grey62] {session_header}",
+                border_style="blue",
+                box=box.ROUNDED,
+                padding=(1, 2)
+            )
+            console.print(panel)
+            console.print()
+
+            for idx, (label, _) in enumerate(menu_options, start=1):
+                console.print(f" [bold cyan]{idx}[/bold cyan] {label}")
+            
+            console.print()
+            console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
+            
+            choice = input().strip()
+            
+            # Map input to action
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(menu_options):
+                    action = menu_options[idx - 1][1]
+                else:
+                    console.print("[red]Invalid selection.[/red]")
+                    time.sleep(1)
+                    continue
+            except ValueError:
                 continue
-        except ValueError:
+        except Exception as e:
+            console.print(f"[bold red]CRITICAL MENU ERROR: {e}[/bold red]")
+            import traceback
+            console.print(traceback.format_exc())
+            # Add a pause so you can read the error before the loop clears the screen
+            Prompt.ask("Press Enter to retry...")
             continue
 
         # --- Dispatcher ---
@@ -2295,7 +2548,7 @@ def handle_menu(_: argparse.Namespace) -> int:
         elif action == "hint":
             if not active_kata_dir:
                 console.print("[bold red]No active kata detected here.[/bold red]")
-                import time; time.sleep(1)
+                time.sleep(1)
                 continue
             question = Prompt.ask("Question focus (optional)", default="")
             handle_hint(
@@ -2315,7 +2568,7 @@ def handle_menu(_: argparse.Namespace) -> int:
         elif action == "peek_current":
             if not active_kata_dir:
                 console.print("[bold red]No active kata detected here.[/bold red]")
-                import time; time.sleep(1)
+                time.sleep(1)
                 continue
             peek_kata_summary(active_kata_dir, notes_root)
             Prompt.ask("\nPress Enter to return to menu")
@@ -2323,7 +2576,7 @@ def handle_menu(_: argparse.Namespace) -> int:
         elif action == "reset_kata":
             if not active_kata_dir:
                 console.print("[bold red]No active kata detected here.[/bold red]")
-                import time; time.sleep(1)
+                time.sleep(1)
                 continue
             handle_reset(argparse.Namespace(project=active_kata_dir.name, root=str(active_kata_dir.parent)))
             Prompt.ask("\nPress Enter to return to menu")
@@ -2331,7 +2584,7 @@ def handle_menu(_: argparse.Namespace) -> int:
         elif action == "solve_kata":
             if not active_kata_dir:
                 console.print("[bold red]No active kata detected here.[/bold red]")
-                import time; time.sleep(1)
+                time.sleep(1)
                 continue
             handle_solve(argparse.Namespace(project=active_kata_dir.name, root=str(active_kata_dir.parent)))
             Prompt.ask("\nPress Enter to return to menu")
@@ -2375,7 +2628,7 @@ def handle_menu(_: argparse.Namespace) -> int:
         elif action == "resume":
             if not resume_slug:
                 console.print("[yellow]No recent kata to resume yet. Start a new session first.[/yellow]")
-                import time; time.sleep(1.5)
+                time.sleep(1.5)
                 continue
             if not resume_dir or not resume_dir.exists():
                 console.print(f"[red]Last kata '{resume_slug}' not found at {resume_dir}.[/red]")
@@ -2423,7 +2676,7 @@ def handle_menu(_: argparse.Namespace) -> int:
                 
             if not idea:
                 console.print("[red]Could not generate an idea.[/red]")
-                import time; time.sleep(2)
+                time.sleep(2)
                 continue
 
             console.print(Panel(f"[bold]{idea}[/bold]", title="Proposed Kata", border_style="green"))
@@ -2432,24 +2685,25 @@ def handle_menu(_: argparse.Namespace) -> int:
                 console.print("Cancelled.")
                 continue
 
-            handle_start(
-                argparse.Namespace(
-                    idea=idea,
-                    template=template,
-                    root=str(kata_root),
-                    notes_root=str(notes_root),
-                    force=False,
-                    pillar=pillar,
-                    mode=mode,
-                    level=level,
-                    tests="edge",
-                    guided=False,
-                    reuse_settings=False,
-                    yes=True,
-                    scaffold="auto",
-                    offline=False,
+            with console.status("[bold green]Creating workspace...[/bold green]", spinner="dots"):
+                handle_start(
+                    argparse.Namespace(
+                        idea=idea,
+                        template=template,
+                        root=str(kata_root),
+                        notes_root=str(notes_root),
+                        force=False,
+                        pillar=pillar,
+                        mode=mode,
+                        level=level,
+                        tests="edge",
+                        guided=False,
+                        reuse_settings=False,
+                        yes=True,
+                        scaffold="auto",
+                        offline=False,
+                    )
                 )
-            )
             # handle_start prints next steps. We exit the menu so they can go code?
             # Or we loop back?
             # Typically user wants to exit menu to go to terminal.
@@ -2463,36 +2717,27 @@ def handle_menu(_: argparse.Namespace) -> int:
             current_xp = skills.get(weakest_pillar, 0)
             level_title, _ = get_level_info(current_xp)
             
-            if level_title == "Novice":
-                difficulty = "foundation"
-            elif level_title in ["Apprentice", "Journeyman"]:
-                difficulty = "proficient"
-            else:
-                difficulty = "stretch"
-
             target_mode = "fastapi" if weakest_pillar == "api" else "script"
 
-            with console.status(f"[bold green]Analysing stats... Weakest: {weakest_pillar.upper()} ({level_title}). Generating {difficulty} drill...[/bold green]", spinner="dots"):
-                idea, _ = pick_idea_with_hints(
-                    provider=DEFAULT_IDEA_PROVIDER,
-                    model=DEFAULT_IDEA_MODEL,
-                    kata_root=kata_root,
-                    notes_root=notes_root,
-                    pillar_hint=weakest_pillar,
-                    level_hint=difficulty,
-                    mode_hint=target_mode,
-                    offline=False,
-                )
+            idea, used_fallback = pick_idea_with_hints(
+                provider=DEFAULT_IDEA_PROVIDER,
+                model=DEFAULT_IDEA_MODEL,
+                kata_root=Path(DEFAULT_KATA_ROOT),
+                notes_root=Path(DEFAULT_NOTES_ROOT),
+                pillar_hint=weakest_pillar,
+                level_hint=difficulty,
+                mode_hint=target_mode,
+                offline=False,
+            )
             
             if not idea:
                 console.print("[red]Could not generate an idea.[/red]")
-                import time; time.sleep(2)
+                time.sleep(2)
                 continue
 
             console.print(Panel(f"[bold]{idea}[/bold]", title=f"⚡ Quick Train: {weakest_pillar.title()} ({difficulty})", border_style="yellow"))
             
             console.print("[dim]Launching in 3 seconds... (Ctrl+C to cancel)[/dim]")
-            import time
             try:
                 time.sleep(3)
             except KeyboardInterrupt:
@@ -2502,8 +2747,8 @@ def handle_menu(_: argparse.Namespace) -> int:
                 argparse.Namespace(
                     idea=idea,
                     template="fastapi" if target_mode == "fastapi" else "script",
-                    root=str(kata_root),
-                    notes_root=str(notes_root),
+                    root=str(DEFAULT_KATA_ROOT),
+                    notes_root=str(DEFAULT_NOTES_ROOT),
                     force=False,
                     pillar=weakest_pillar,
                     mode=target_mode,
@@ -2514,6 +2759,7 @@ def handle_menu(_: argparse.Namespace) -> int:
                     yes=True, 
                     scaffold="auto",
                     offline=False,
+                    launch=True, # Auto-launch
                 )
             )
             # Auto-exit to let them code
@@ -2822,6 +3068,36 @@ def build_test_hint_prompt(project_dir: Path, notes_root: Path, max_hints: int) 
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def generate_with_progress(
+    task_name: str,
+    provider: str,
+    model: str,
+    messages: list[dict[str, str]]
+) -> Optional[str]:
+    """
+    Wraps call_idea_api with a nice multi-step progress spinner.
+    """
+    steps = [
+        "Analyzing request...",
+        "Consulting the archives...",
+        "Drafting response...",
+        "Refining logic...",
+        "Finalizing output..."
+    ]
+    
+    # Since we can't update text during the blocking call easily without threads,
+    # we'll just show a nice indeterminate spinner with a fixed title, 
+    # but initially cycle a few messages to show "life".
+    # Actually, let's just use a nice bold spinner.
+    
+    with console.status(f"[bold green]{task_name}...[/bold green]", spinner="dots") as status:
+        # We can't cycle messages during urlopen block.
+        # But we can simulate "Thinking" start.
+        time.sleep(0.5)
+        status.update(f"[bold green]{task_name}: Connecting to {provider}...[/bold green]")
+        return call_idea_api(provider, model, messages)
+
+
 def call_idea_api(provider: str, model: str, messages: list[dict[str, str]]) -> Optional[str]:
     """
     Call the selected provider to get idea suggestions.
@@ -2974,7 +3250,7 @@ def pick_idea_with_hints(
         level_hint=level_hint,
         mode_hint=mode_hint,
     )
-    content = call_idea_api(provider=provider, model=model, messages=messages)
+    content = generate_with_progress("Generating Idea", provider, model, messages)
     idea = parse_idea_content(content) if content else None
     if idea:
         return idea, False
@@ -3492,7 +3768,7 @@ def generate_scaffold_spec(
     spec = parse_scaffold_spec(content) if content else None
     fallback_used = False
     if not spec:
-        spec = fallback_scaffold_spec(idea_line)
+        spec = fallback_scaffold_spec(idea_line, template=template)
         fallback_used = True
     return spec, fallback_used
 
@@ -3697,7 +3973,16 @@ def apply_kata_scaffold(
                 md_lines.append(f"  - Example args: {example.get('args', [])}, kwargs: {example.get('kwargs', {})}, output: {example.get('output')}")
             edge = fn.get("edge_cases") or []
             if edge:
-                md_lines.append(f"  - Edge cases: {', '.join(edge)}")
+                edge_strs = []
+                for item in edge:
+                    if isinstance(item, dict):
+                        if "description" in item:
+                            edge_strs.append(str(item.get("description")))
+                        else:
+                            edge_strs.append(json.dumps(item))
+                    else:
+                        edge_strs.append(str(item))
+                md_lines.append(f"  - Edge cases: {', '.join(edge_strs)}")
     else:
         md_lines.append("Implement the FastAPI routes below:")
         for route in routes:
@@ -4000,11 +4285,15 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser = build_parser()
     parsed_args = parser.parse_args(list(argv) if argv is not None else None)
     func = getattr(parsed_args, "func", None)
-    if func is None:
-        # No command provided: go to menu.
-        return handle_menu(argparse.Namespace())
-    result = func(parsed_args)
-    return int(result) if isinstance(result, int) else 0
+    try:
+        if func is None:
+            # No command provided: go to menu.
+            return handle_menu(argparse.Namespace())
+        result = func(parsed_args)
+        return int(result) if isinstance(result, int) else 0
+    except KeyboardInterrupt:
+        console.print("[yellow]Interrupted by user. Exiting.[/yellow]")
+        return 1
 
 
 if __name__ == "__main__":
