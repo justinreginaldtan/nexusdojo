@@ -650,9 +650,17 @@ def handle_watch(args: argparse.Namespace) -> int:
         mins, secs = divmod(elapsed_secs, 60)
         watch_display = f"Current Kata > {project_dir.name}"
         keys_line = "p: pause   r: run test   a: ask   c: clear   q: quit"
-        pause_tag = "[yellow](paused) [/yellow]" if paused_banner else ""
+        timer_display = f"{mins:02}:{secs:02}"
+        # Build timer string with consistent width for alignment
+        if paused_banner:
+            # Keep consistent width: "(paused) " is 9 chars
+            timer_col = f"[dim](paused) {timer_display}[/dim]"
+        else:
+            # Pad with spaces to match the width of "(paused) " (9 chars)
+            timer_col = f"[dim]         {timer_display}[/dim]"
         grid = Table.grid(expand=True)
-        grid.add_row(f"[center]{watch_display}[/center]")
+        # First row: project name on left, timer on right (matching Sensei Response style)
+        grid.add_row(watch_display, timer_col, style="")
         grid.add_row("Edit any .py file to trigger tests.")
         grid.add_row(f"[dim]{keys_line}[/dim]")
         return Panel(
@@ -660,8 +668,6 @@ def handle_watch(args: argparse.Namespace) -> int:
             border_style="blue",
             title="[bold]Sensei Watch[/bold]",
             title_align="center",
-            subtitle=f"[dim]{pause_tag}{mins:02}:{secs:02}[/dim]",
-            subtitle_align="right",
         )
 
     def render_status(status: str) -> None:
@@ -719,49 +725,93 @@ def handle_watch(args: argparse.Namespace) -> int:
         console.print(Panel(summarize_failure_output(output), title=f"Test {test_name}", border_style=style))
         return result.returncode
 
-    def build_sensei_hint(question: str) -> Panel:
+    def build_sensei_hint(question: str, timestamp: str = "") -> Panel:
         """
         Build a short hint using local context (mission + last failure + streak).
         """
-        mission_excerpt = ""
-        mission_path = project_dir / "MISSION.md"
-        if mission_path.exists():
-            mission_excerpt = "\n".join(mission_path.read_text().splitlines()[:6])
-        lines = []
+        # Build structured content sections
+        sections = []
+
         if question:
-            lines.append(f"[bold]Question:[/bold] {question}")
-            lines.append("")
+            sections.append(f"[bold]Your Question[/bold]\n{question}")
+
         if last_failure_detail:
             fail_name = last_failure_detail.get("test", "")
             fail_line = last_failure_detail.get("line", "")
             snippet = summarize_text(last_failure_detail.get("snippet", ""), 160)
-            if fail_name or fail_line:
-                lines.append(f"[bold]Last fail:[/bold] {fail_name} {fail_line}".strip())
+            fail_info = []
+            if fail_name:
+                fail_info.append(f"[dim]{fail_name}[/dim]")
+            if fail_line:
+                fail_info.append(f"[dim]{fail_line}[/dim]")
+            if fail_info:
+                sections.append(f"[bold]Last Failure[/bold]\n" + "\n".join(fail_info))
             if snippet:
-                lines.append(snippet)
-            lines.append("")
+                sections.append(f"[dim]{snippet}[/dim]")
+
         if history:
-            lines.append(f"[bold]Recent runs:[/bold] {' '.join(history)}")
-            lines.append("")
-        guidance = fallback_hint(question)
+            sections.append(f"[bold]Recent Results[/bold]\n{' '.join(history)}")
+
+        # Try LLM-powered guidance first, then fall back to deterministic hints
+        guidance = None
+        try:
+            # Build context for LLM
+            context = f"Question: {question}\n"
+            if last_failure_detail:
+                context += f"Last failure: {last_failure_detail.get('test', 'unknown')}\n"
+                context += f"Error: {last_failure_detail.get('snippet', '')[:200]}\n"
+            if history:
+                context += f"Recent results: {' '.join(history)}\n"
+            mission_path = project_dir / "MISSION.md"
+            if mission_path.exists():
+                context += f"Mission:\n{mission_path.read_text()[:500]}\n"
+
+            system = (
+                "You are a helpful coding tutor. Based on the student's question and test failures, "
+                "provide 2-3 SHORT, actionable suggestions to help them debug. Be specific and practical. "
+                "Focus on what they should check or try next, not the full solution."
+            )
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": context}
+            ]
+            guidance = call_idea_api(DEFAULT_IDEA_PROVIDER, DEFAULT_IDEA_MODEL, messages)
+        except Exception:
+            guidance = None
+
+        if not guidance:
+            guidance = fallback_hint(question)
+
         if guidance:
             cleaned: list[str] = []
             for line in guidance.splitlines():
                 if re.search(r"re-?read your question", line, re.IGNORECASE):
                     continue
-                cleaned.append(line.strip())
+                clean_line = line.strip()
+                # Remove leading dashes/bullets that might be duplicated
+                clean_line = re.sub(r"^[\-•]\s*", "", clean_line)
+                if clean_line:
+                    cleaned.append(clean_line)
             cleaned = [ln for ln in cleaned if ln]
             if cleaned:
-                bullet_lines = "\n".join(f"- {ln}" for ln in cleaned)
-                lines.append(f"[bold]Sensei:[/bold]\n{bullet_lines}")
-        body = "\n".join([ln for ln in lines if ln.strip() != ""])
-        return Panel(body, title="💡 Sensei Hint", border_style="yellow")
+                suggestion_lines = "\n".join(f"• {ln}" for ln in cleaned)
+                sections.append(f"[bold]Suggestions[/bold]\n{suggestion_lines}")
+
+        body = "\n\n".join(sections)
+
+        # Create panel with title integrated at top
+        return Panel(
+            body,
+            border_style="yellow",
+            title="[bold]Sensei Response[/bold]",
+            title_align="center",
+        )
 
     def execute_check(single_test: Optional[str] = None) -> None:
         """
         Run either full check or a single test, with state tracking.
         """
-        nonlocal last_status, last_checked, last_duration, last_failure_detail, last_failure_sig, repeat_fail_count, running_tests
+        nonlocal last_status, last_checked, last_duration, last_failure_detail, last_failure_sig, repeat_fail_count, running_tests, sensei_block
         if paused or stop_keys.is_set():
             return
         if not run_lock.acquire(blocking=False):
@@ -769,7 +819,7 @@ def handle_watch(args: argparse.Namespace) -> int:
         try:
             running_tests = True
             started_at = time.time()
-            live_pause()
+            # Don't pause Live display - we'll show a loading indicator within it
             if single_test:
                 rc = run_single_test(single_test)
                 failure_info = None
@@ -801,25 +851,30 @@ def handle_watch(args: argparse.Namespace) -> int:
                     sig = output_signature or (detail.get("test", "") + detail.get("line", ""))
                     if sig and sig == last_failure_sig:
                         repeat_fail_count += 1
-                        console.print(f"[yellow]Same failure x{repeat_fail_count}.[/yellow]")
                     else:
                         repeat_fail_count = 1
                         last_failure_sig = sig
-                        snippet = detail.get("snippet", "").strip()
-                        name = detail.get("test", "unknown")
-                        line = detail.get("line", "")
-                        console.print(Panel(
-                            f"{line}\n\n{snippet}",
-                            title=f"❌ Last failing test: {name}",
-                            border_style="red",
-                        ))
+
+                    # Always display failure detail to user
+                    snippet = detail.get("snippet", "").strip()
+                    name = detail.get("test", "unknown")
+                    line = detail.get("line", "")
+                    live_pause()
+                    console.print(Panel(
+                        f"{line}\n\n{snippet}",
+                        title=f"❌ Last failing test: {name}",
+                        border_style="red",
+                    ))
+                    live_resume()
                     last_failure_detail = detail
             else:
                 repeat_fail_count = 0
                 last_failure_detail = None
                 last_failure_sig = None
+            # Clear sensei block and show result toast
+            sensei_block = None
+            set_toast(f"✓ Passed" if rc == 0 else "✗ Failed", duration=5.0)
         finally:
-            live_resume()
             running_tests = False
             run_lock.release()
 
@@ -852,7 +907,6 @@ def handle_watch(args: argparse.Namespace) -> int:
                     set_toast("Cleared")
                     sensei_block = None
                 elif ch.lower() == "r":
-                    set_toast("Running tests...")
                     execute_check()
                 elif ch.lower() == "a":
                     set_toast("Ask Sensei")
@@ -862,16 +916,10 @@ def handle_watch(args: argparse.Namespace) -> int:
                     live_resume()
                     input_mode = False
                     if question.strip():
-                        hint = build_sensei_hint(question.strip())
-                        payload = hint.renderable if isinstance(hint, Panel) else hint
-                        sensei_block = Panel(
-                            payload,
-                            title="Sensei Response",
-                            subtitle=datetime.now().strftime("%H:%M:%S"),
-                            subtitle_align="right",
-                            border_style="yellow",
-                            title_align="center",
-                        )
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        # Build hint with timestamp in title
+                        hint = build_sensei_hint(question.strip(), timestamp)
+                        sensei_block = hint
                         set_toast("Sensei response ready")
                     else:
                         set_toast("Ask cancelled")
@@ -918,27 +966,35 @@ def handle_watch(args: argparse.Namespace) -> int:
                 if not paused:
                     elapsed_seconds += now - last_tick
                 last_tick = now
-                if input_mode or running_tests:
+                if input_mode:
                     time.sleep(0.1)
                     continue
                 elapsed_display = int(elapsed_seconds)
-                if last_checked:
-                    status_line = f"last {last_status}"
-                    if last_duration:
-                        status_line += f" ({last_duration})"
-                    status_line += f" at {last_checked}"
+
+                # Show loading state while tests are running
+                if running_tests:
+                    status_renderable = Spinner("dots", text="Running tests...")
+                elif last_checked:
                     bar = history_bar()
+                    # Format: "Test Passed/Failed (6.9s) at 01:44:18" followed by history bar
+                    status_text = "Test Passed" if last_status == "Passed" else "Test Failed"
+                    status_line = f"[bold]{status_text}[/bold]"
+                    if last_duration:
+                        status_line += f" [dim]({last_duration})[/dim]"
+                    status_line += f" [dim]at {last_checked}[/dim]"
                     if bar:
-                        status_line = f"{status_line} {bar}".strip()
-                    status_renderable = Text(status_line or " ", justify="left")
+                        status_line += f" {bar}"
+                    status_renderable = Text.from_markup(status_line or " ", justify="left")
                 else:
                     status_renderable = Spinner("dots", text="Listening…")
+
                 toast_line = ""
                 if toast_msg and time.time() < toast_until:
                     toast_line = toast_msg
                 else:
                     toast_msg = ""
                     toast_until = 0.0
+
                 blocks = [
                     build_banner(elapsed_display, paused),
                     status_renderable,
@@ -947,7 +1003,7 @@ def handle_watch(args: argparse.Namespace) -> int:
                     blocks.append(sensei_block)
                 blocks.append(Text(toast_line or " ", style="dim", justify="left"))
                 live.update(Group(*blocks))
-                time.sleep(1.0)
+                time.sleep(0.2 if running_tests else 1.0)
     except KeyboardInterrupt:
         observer.stop()
         console.print("\n[blue]Watch stopped.[/blue]")
@@ -964,6 +1020,8 @@ def handle_check(args: argparse.Namespace) -> int:
     """
     import subprocess
 
+    notes_root = Path(getattr(args, "notes_root", DEFAULT_NOTES_ROOT)).expanduser()
+    notes_root.mkdir(parents=True, exist_ok=True)
     kata_root = Path(args.root).expanduser()
     if args.project:
         project_dir = kata_root / args.project
@@ -980,8 +1038,12 @@ def handle_check(args: argparse.Namespace) -> int:
     
     # Check for auto-log flag passed via args or inferred
     auto_log = getattr(args, "auto_log", False)
-    
-    console.print(f"[bold blue]Running tests for:[/bold blue] {project_dir.name}...")
+
+    # In watch mode, suppress verbose output to avoid breaking the Live display
+    silent_mode = auto_log
+
+    if not silent_mode:
+        console.print(f"[bold blue]Running tests for:[/bold blue] {project_dir.name}...")
 
     collect_failure = bool(getattr(args, "collect_failure", False))
 
@@ -995,13 +1057,20 @@ def handle_check(args: argparse.Namespace) -> int:
 
     if result.returncode == 0:
         # Success Case
-        console.print(Panel(
-            "[bold green]ALL TESTS PASSED[/bold green]\n\n"
-            "Great work, Engineer. The system is stable.",
-            title="✅ MISSION COMPLETE",
-            border_style="green",
-            box=box.DOUBLE
-        ))
+        if not silent_mode:
+            console.print(Panel(
+                "[bold green]ALL TESTS PASSED[/bold green]\n\n"
+                "Great work, Engineer. The system is stable.",
+                title="✅ MISSION COMPLETE",
+                border_style="green",
+                box=box.DOUBLE
+            ))
+
+        # Mark tutorial complete if applicable
+        if project_dir.name == "tutorial-hello":
+            marker = notes_root / ".tutorial_complete"
+            marker.write_text("tutorial complete", encoding="utf-8")
+            console.print("[bold green]Tutorial complete! Returning you to the main menu next time.[/bold green]")
 
         # --- Progression System ---
         kata_meta_path = project_dir / ".kata.json"
@@ -1010,28 +1079,31 @@ def handle_check(args: argparse.Namespace) -> int:
                 meta = json.loads(kata_meta_path.read_text())
                 pillar = meta.get("pillar", "mixed")
                 cheated = meta.get("cheated", False)
-                
-                if cheated:
-                    console.print("[dim]XP forfeited (Solution Used).[/dim]")
-                elif not auto_log:
-                    console.print(f"[bold]Rate this drill ([cyan]{pillar.upper()}[/cyan]):[/bold]")
-                    console.print("[1] Too Easy  (Speed +5 XP)")
-                    console.print("[2] Perfect   (Growth +15 XP)")
-                    console.print("[3] Too Hard  (Grit +20 XP)")
-                    rating = Prompt.ask("Rating", choices=["1", "2", "3"], default="2")
-                    xp_gain, new_level = update_skill(Path(args.notes_root), pillar, rating)
-                    console.print(Panel(
-                        f"XP Gained: [bold gold1]+{xp_gain}[/bold gold1]\n"
-                        f"New Level: [bold cyan]{new_level}[/bold cyan]",
-                        title="🆙 LEVEL UP",
-                        border_style="gold1"
-                    ))
-                elif auto_log and not cheated:
+
+                if not silent_mode:
+                    if cheated:
+                        console.print("[dim]XP forfeited (Solution Used).[/dim]")
+                    elif not auto_log:
+                        console.print(f"[bold]Rate this drill ([cyan]{pillar.upper()}[/cyan]):[/bold]")
+                        console.print("[1] Too Easy  (Speed +5 XP)")
+                        console.print("[2] Perfect   (Growth +15 XP)")
+                        console.print("[3] Too Hard  (Grit +20 XP)")
+                        rating = Prompt.ask("Rating", choices=["1", "2", "3"], default="2")
+                        xp_gain, new_level = update_skill(Path(args.notes_root), pillar, rating)
+                        console.print(Panel(
+                            f"XP Gained: [bold gold1]+{xp_gain}[/bold gold1]\n"
+                            f"New Level: [bold cyan]{new_level}[/bold cyan]",
+                            title="🆙 LEVEL UP",
+                            border_style="gold1"
+                        ))
+
+                if auto_log and not cheated:
                      # In silent mode, we award standard XP (Perfect=15) silently
                      update_skill(Path(args.notes_root), pillar, "2")
-                     
+
             except Exception as e:
-                console.print(f"[dim]XP update failed: {e}[/dim]")
+                if not silent_mode:
+                    console.print(f"[dim]XP update failed: {e}[/dim]")
 
         # Auto-log logic
         if auto_log:
@@ -1043,49 +1115,57 @@ def handle_check(args: argparse.Namespace) -> int:
                 root=str(kata_root),
                 notes_root=str(args.notes_root)
             ))
-            console.print("[dim]✔ Logged to history.[/dim]")
-        elif Confirm.ask("Log this victory?"):
-            note = Prompt.ask("What did you learn/build?")
-            handle_log(argparse.Namespace(
-                project=project_dir.name,
-                note=note,
-                root=str(kata_root),
-                notes_root=str(args.notes_root)
-            ))
+        elif not silent_mode:
+            if Confirm.ask("Log this victory?"):
+                note = Prompt.ask("What did you learn/build?")
+                handle_log(argparse.Namespace(
+                    project=project_dir.name,
+                    note=note,
+                    root=str(kata_root),
+                    notes_root=str(args.notes_root)
+                ))
         return (0, None) if collect_failure else 0
 
     else:
         # Failure Case
         error_out = result.stderr or result.stdout
-        
-        # Truncate if huge
-        if len(error_out) > 2000:
-            error_disp = error_out[:2000] + "\n... (truncated)"
-        else:
-            error_disp = error_out
 
-        console.print(Panel(
-            f"[white]{error_disp.strip()}[/white]",
-            title="[bold red]❌ TESTS FAILED[/bold red]",
-            border_style="red",
-            box=box.HEAVY
-        ))
-        
-        console.print("\n[bold yellow]Analyzing failure...[/bold yellow]")
-        
-        # AI Diagnosis
-        diagnosis = get_failure_diagnosis(
-            project_dir.name, 
-            error_out, 
-            Path(args.notes_root)
-        )
-        
-        console.print(Panel(
-            diagnosis,
-            title="🤖 Sensei Diagnosis",
-            border_style="yellow",
-            padding=(1, 2)
-        ))
+        if not silent_mode:
+            # Truncate if huge
+            if len(error_out) > 2000:
+                error_disp = error_out[:2000] + "\n... (truncated)"
+            else:
+                error_disp = error_out
+
+            console.print(Panel(
+                f"[white]{error_disp.strip()}[/white]",
+                title="[bold red]❌ TESTS FAILED[/bold red]",
+                border_style="red",
+                box=box.HEAVY
+            ))
+
+            console.print("\n[bold yellow]Analyzing failure...[/bold yellow]")
+
+            # AI Diagnosis
+            diagnosis = get_failure_diagnosis(
+                project_dir.name,
+                error_out,
+                Path(args.notes_root)
+            )
+
+            console.print(Panel(
+                diagnosis,
+                title="🤖 Sensei Diagnosis",
+                border_style="yellow",
+                padding=(1, 2)
+            ))
+        else:
+            # Still get diagnosis in silent mode for failure_detail collection
+            get_failure_diagnosis(
+                project_dir.name,
+                error_out,
+                Path(args.notes_root)
+            )
         if collect_failure:
             fail_lines = (error_out or "").splitlines()
             test_name = ""
@@ -1144,6 +1224,65 @@ def summarize_failure_output(output: str, max_lines: int = 20, max_chars: int = 
     if len(trimmed) > max_chars:
         trimmed = trimmed[:max_chars].rstrip() + "\n... (truncated)"
     return trimmed
+
+
+def is_first_time_user(kata_root: Path, notes_root: Path) -> bool:
+    """
+    Determine if the user is brand new (no katas/logs and no tutorial marker).
+    """
+    marker = notes_root / ".tutorial_complete"
+    if marker.exists():
+        return False
+    has_logs = (notes_root / "log.md").exists() and (notes_root / "log.md").stat().st_size > 0
+    tutorial_exists = (kata_root / "tutorial-hello").exists()
+    has_katas = any((p / "tests").exists() for p in kata_root.iterdir() if p.is_dir())
+    if tutorial_exists and not marker.exists():
+        return True
+    return not has_logs and not has_katas
+
+
+def ensure_tutorial_kata(kata_root: Path) -> Path:
+    """
+    Create a minimal tutorial kata if it does not exist.
+    """
+    tutorial_dir = kata_root / "tutorial-hello"
+    tests_dir = tutorial_dir / "tests"
+    tutorial_dir.mkdir(parents=True, exist_ok=True)
+    tests_dir.mkdir(parents=True, exist_ok=True)
+
+    mission = """Mission: Print a friendly greeting.
+
+Implement main() so it returns the exact string "Hello Dojo".
+"""
+    readme = "# Tutorial: Hello Dojo\n\nA tiny kata to learn the flow. Edit main.py, run tests, make them pass."
+    main_py = """def main():
+    \"\"\"Return a friendly greeting.\"\"\"
+    # TODO: replace the placeholder with the expected string
+    return \"\"
+
+
+if __name__ == \"__main__\":
+    print(main())
+"""
+    test_main = """import unittest
+from main import main
+
+
+class TestHello(unittest.TestCase):
+    def test_greeting(self):
+        self.assertEqual(main(), \"Hello Dojo\")
+
+
+if __name__ == \"__main__\":
+    unittest.main()
+"""
+    (tutorial_dir / "MISSION.md").write_text(mission, encoding="utf-8")
+    (tutorial_dir / "README.md").write_text(readme, encoding="utf-8")
+    if not (tutorial_dir / "main.py").exists():
+        (tutorial_dir / "main.py").write_text(main_py, encoding="utf-8")
+    if not (tests_dir / "test_main.py").exists():
+        (tests_dir / "test_main.py").write_text(test_main, encoding="utf-8")
+    return tutorial_dir
 
 
 def get_level_info(xp: int) -> tuple[str, str]:
@@ -1859,22 +1998,6 @@ def launch_session(project_dir: Path) -> None:
     import subprocess
     import os
     
-    # --- Auto-Sitrep ---
-    log_path = project_dir / "LOG.md"
-    sitrep = "No prior logs."
-    if log_path.exists():
-        lines = log_path.read_text().splitlines()
-        if lines:
-            sitrep = lines[-1] # Last line
-    
-    console.print(Panel(
-        f"[bold]Project:[/bold] {project_dir.name}\n"
-        f"[bold]Last Log:[/bold] {sitrep}",
-        title="📝 SITREP",
-        border_style="yellow"
-    ))
-    time.sleep(1.5) # Let them read it
-
     # Check for TMUX
     in_tmux = os.environ.get("TMUX") is not None
     
@@ -2313,6 +2436,9 @@ def handle_history(args: argparse.Namespace) -> int:
     kata_root = Path(args.root).expanduser()
     notes_root = Path(args.notes_root).expanduser()
     notes_root.mkdir(parents=True, exist_ok=True)
+    active_profile = ensure_profile_selected(notes_root)
+    settings = load_settings(notes_root)
+    user_name = settings.get("user_name", active_profile or "Engineer")
 
     window_days = max(1, getattr(args, "days", 30))
     since_dt = datetime.now() - timedelta(days=window_days)
@@ -2333,7 +2459,7 @@ def handle_history(args: argparse.Namespace) -> int:
     else:
         stats.add_row("Last entry", "No history yet")
 
-    console.print(Panel(stats, title="📊 Profile & History", border_style="cyan"))
+    console.print(Panel(stats, title=f"📊 Profile & History ({user_name})", border_style="cyan"))
 
     activity = Table(title=f"Recent activity (last {window_days} days)", box=box.MINIMAL)
     activity.add_column("When", style="cyan", no_wrap=True)
@@ -2346,6 +2472,45 @@ def handle_history(args: argparse.Namespace) -> int:
         activity.add_row("-", "-", "No entries yet. Finish a kata and log a note to populate this.")
     console.print(activity)
     console.print()
+
+    # Profile actions submenu
+    console.print("[bold]Profile actions:[/bold]")
+    console.print(" [bold cyan]1[/bold cyan] View profile details")
+    console.print(" [bold cyan]2[/bold cyan] Create new profile")
+    console.print(" [bold cyan]3[/bold cyan] Switch profile")
+    console.print(" [bold cyan]4[/bold cyan] Log out / landing state\n")
+    choice = Prompt.ask(
+        "[italic grey50]Select an option [1-4]:[/italic grey50]",
+        choices=["1", "2", "3", "4", ""],
+        default="1",
+        show_choices=False,
+    ) or "1"
+
+    if choice == "2":
+        name = sanitize_profile_name(Prompt.ask("Enter a profile name", default="engineer"))
+        if not name:
+            name = "engineer"
+        set_current_profile_name(notes_root, name)
+        save_settings(notes_root, {"user_name": name})
+        console.print(f"[green]Profile '{name}' created and set active.[/green]")
+        Prompt.ask("\nPress Enter to return to menu")
+    elif choice == "3":
+        profiles = list_profiles(notes_root)
+        if not profiles:
+            console.print("[yellow]No profiles to switch to. Create one first.[/yellow]")
+            Prompt.ask("\nPress Enter to return to menu")
+        else:
+            target = Prompt.ask("Choose profile", choices=profiles, default=profiles[0])
+            set_current_profile_name(notes_root, target)
+            console.print(f"[green]Switched to profile '{target}'.[/green]")
+            Prompt.ask("\nPress Enter to return to menu")
+    elif choice == "4":
+        clear_current_profile(notes_root)
+        console.print("[dim]Logged out. You'll be asked to choose a profile next time.[/dim]")
+        Prompt.ask("\nPress Enter to return to menu")
+    else:
+        # View only, already shown
+        Prompt.ask("\nPress Enter to return to menu")
     return 0
 
 
@@ -2758,6 +2923,16 @@ def handle_menu(_: argparse.Namespace) -> int:
     force_lobby_view = False
     run_boot_diagnostics(kata_root, notes_root)
 
+    # Require an active profile before continuing
+    ensure_profile_selected(notes_root)
+
+    # First-time tutorial flow (after profile selection)
+    if is_first_time_user(kata_root, notes_root):
+        tutorial_dir = ensure_tutorial_kata(kata_root)
+        console.print("[dim]Launching tutorial...[/dim]")
+        launch_session(tutorial_dir)
+        return 0
+
     while True:
         import time # Import time locally here
         try:
@@ -2792,9 +2967,9 @@ def handle_menu(_: argparse.Namespace) -> int:
 
             # --- Dashboard Layout (Focus Highlight) ---
             
-            top_grid = Table.grid(expand=True, padding=(0, 1))
-            top_grid.add_column(ratio=1) # Left: User Info, Focus
-            top_grid.add_column(ratio=1) # Right: Context, Logs, Skills
+            top_grid = Table.grid(expand=True, padding=(0, 2))
+            top_grid.add_column(ratio=3) # Left: User Info, Focus
+            top_grid.add_column(ratio=2) # Right: Context, Logs, Skills
             
             # Left Side: User Info, XP, Katas, Streak, Skills
             left = Table.grid(padding=0)
@@ -2834,7 +3009,7 @@ def handle_menu(_: argparse.Namespace) -> int:
             top_grid.add_row(left, right)
 
             # Footer
-            footer_text = f"\"Simplicity is the soul of efficiency.\" - Austin Freeman" # Placeholder, later from a list
+            footer_text = f"\"karmanyeva adhikaras te ma phaleshu kadachana\""
             
             # Combine
             main_layout = Table.grid(expand=True)
@@ -2844,31 +3019,31 @@ def handle_menu(_: argparse.Namespace) -> int:
 
 
             resume_slug, resume_dir = resolve_last_kata(kata_root, notes_root)
-            resume_label = "▶️ Resume Last Kata"
+            resume_label = "Resume Last Kata"
             if resume_slug:
-                resume_label = f"▶️ Resume Last Kata ({resume_slug})"
+                resume_label = f"Resume Last Kata ({resume_slug})"
             else:
                 resume_label += " (none yet)"
 
             # --- Menu Options ---
             if in_kata_context:
                 menu_options = [
-                    ("✅ Sensei Check (Run Tests)", "check"),
-                    ("👀 Sensei Watch Mode", "watch"),
-                    ("💡 Get Unstuck (Hint)", "hint"),
-                    ("📄 Peek This Kata (README/LOG)", "peek_current"),
-                    ("🧹 Reset Kata", "reset_kata"),
-                    ("🧠 Request Solution (Zero XP)", "solve_kata"),
-                    ("🔙 Return to Lobby Menu", "return_lobby"),
+                    ("Sensei Check (Run Tests)", "check"),
+                    ("Sensei Watch Mode", "watch"),
+                    ("Get Unstuck (Hint)", "hint"),
+                    ("Peek This Kata (README/LOG)", "peek_current"),
+                    ("Reset Kata", "reset_kata"),
+                    ("Request Solution (Zero XP)", "solve_kata"),
+                    ("Return to Lobby Menu", "return_lobby"),
                 ]
             else:
                 menu_options = [
-                    ("⚡ Quick Train (AI-Guided)", "quick_train"),
-                    ("🚀 Start New Session (Manual)", "start_auto"),
+                    ("Quick Train", "quick_train"),
+                    ("Start New Session", "start_auto"),
                     (resume_label, "resume"),
-                    ("📊 Profile & History", "profile_history"),
-                    ("❓ Help & Workflow", "help"),
-                    ("🚪 Exit", "exit"),
+                    ("Profile & History", "profile_history"),
+                    ("Help & Workflow", "help"),
+                    ("Exit", "exit"),
                 ]
                 if force_lobby_view and active_kata_dir:
                     menu_options.insert(-1, ("⬅️ Back to Kata Tools", "back_to_kata"))
@@ -2919,6 +3094,7 @@ def handle_menu(_: argparse.Namespace) -> int:
             
         if action == "profile_history":
             handle_history(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
+            Prompt.ask("\nPress Enter to return to menu")
             
         elif action == "help":
             handle_help(argparse.Namespace())
@@ -3025,21 +3201,49 @@ def handle_menu(_: argparse.Namespace) -> int:
                 console.print(f"[red]Last kata '{resume_slug}' not found at {resume_dir}.[/red]")
                 Prompt.ask("\nPress Enter to return to menu")
                 continue
-            # Always show a quick summary before resuming
-            peek_kata_summary(resume_dir, notes_root)
-            if Confirm.ask("Run quick test preview before launch?", default=True):
+            # Concise summary panel
+            mission = (resume_dir / "MISSION.md").read_text().splitlines() if (resume_dir / "MISSION.md").exists() else []
+            readme = (resume_dir / "README.md").read_text().splitlines() if (resume_dir / "README.md").exists() else []
+            mission_line = ""
+            for line in mission:
+                clean = re.sub(r"^#+\s*", "", line).strip()
+                if clean:
+                    mission_line = clean
+                    break
+            if mission_line:
+                mission_line = re.sub(r"^Mission:\s*", "", mission_line, flags=re.IGNORECASE).strip()
+            if not mission_line and readme:
+                mission_line = readme[0].lstrip("# ").strip()
+            last_log_raw = last_lines(resume_dir / "LOG.md", 1) if (resume_dir / "LOG.md").exists() else "No prior logs."
+            last_log = summarize_text(last_log_raw.replace("\n", " "), 120)
+            summary_body = (
+                f"[bold]Kata:[/bold] {resume_dir.name}\n"
+                f"[bold]Mission:[/bold] {mission_line or 'No mission summary.'}\n"
+                f"[bold]Path:[/bold] {resume_dir.resolve()}\n"
+                f"[bold]Last activity:[/bold] {last_log}"
+            )
+            console.print(Panel(summary_body, title="Resume Last Kata", border_style="cyan"))
+
+            console.print("\n[bold]Choose an option:[/bold]")
+            console.print(" [bold cyan]1[/bold cyan] Resume now")
+            console.print(" [bold cyan]2[/bold cyan] Quick test preview, then resume")
+            console.print(" [bold cyan]3[/bold cyan] Return to menu\n")
+            choice = Prompt.ask(
+                "[italic grey50]Select an option [1-3]:[/italic grey50]",
+                choices=["1", "2", "3", ""],
+                default="1",
+                show_choices=False,
+            ) or "1"
+            if choice == "3":
+                console.print("[dim]Returning to menu...[/dim]")
+                time.sleep(0.8)
+                continue
+            if choice == "2":
                 passed, summary = quick_check_preview(resume_dir, notes_root)
                 style = "green" if passed else "red"
                 console.print(Panel(summary, title="Test Preview", border_style=style))
-            if not Confirm.ask("Launch training environment now?", default=True):
-                console.print(Panel(
-                    f"Path: {resume_dir.resolve()}\n"
-                    f"- cd {resume_dir.name}\n- Read MISSION.md\n- Run `dojo check`\n- Open main.py",
-                    title="Next Steps",
-                    border_style="yellow"
-                ))
-                Prompt.ask("\nPress Enter to return to menu")
-                continue
+                time.sleep(0.8)
+            console.print("[dim]Launching...[/dim]")
             launch_session(resume_dir)
             continue
 
@@ -3226,25 +3430,78 @@ def append_line(path: Path, line: str) -> None:
         handle.write(line)
 
 
+def get_profiles_dir(notes_root: Path) -> Path:
+    path = notes_root / "profiles"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_current_profile_name(notes_root: Path) -> Optional[str]:
+    pointer = notes_root / ".current_profile"
+    if pointer.exists():
+        name = pointer.read_text().strip()
+        return name or None
+    return None
+
+
+def set_current_profile_name(notes_root: Path, name: str) -> None:
+    notes_root.mkdir(parents=True, exist_ok=True)
+    (notes_root / ".current_profile").write_text(name.strip())
+
+
+def clear_current_profile(notes_root: Path) -> None:
+    pointer = notes_root / ".current_profile"
+    if pointer.exists():
+        pointer.unlink()
+
+
+def list_profiles(notes_root: Path) -> list[str]:
+    profiles_dir = get_profiles_dir(notes_root)
+    return sorted(p.stem for p in profiles_dir.glob("*.json") if p.is_file())
+
+
 def load_settings(notes_root: Path) -> dict[str, str]:
     """
-    Load persisted guided start settings.
+    Load persisted guided start settings for the active profile (falls back to legacy file).
     """
+    profiles_dir = get_profiles_dir(notes_root)
+    current = get_current_profile_name(notes_root)
+    if current:
+        profile_path = profiles_dir / f"{current}.json"
+        if profile_path.exists():
+            try:
+                return json.loads(profile_path.read_text())
+            except json.JSONDecodeError:
+                return {}
+    # Legacy fallback
     settings_path = notes_root / "dojo_settings.json"
-    if not settings_path.exists():
-        return {}
-    try:
-        return json.loads(settings_path.read_text())
-    except json.JSONDecodeError:
-        return {}
+    if settings_path.exists():
+        try:
+            data = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            return {}
+        # Promote legacy settings into a default profile
+        current = current or "default"
+        set_current_profile_name(notes_root, current)
+        save_settings(notes_root, data)
+        return data
+    return {}
 
 
 def save_settings(notes_root: Path, settings: dict[str, str]) -> None:
     """
-    Persist guided start settings.
+    Persist guided start settings for the active profile (and mirror to legacy file).
     """
-    settings_path = notes_root / "dojo_settings.json"
-    settings_path.write_text(json.dumps(settings, indent=2))
+    profiles_dir = get_profiles_dir(notes_root)
+    current = get_current_profile_name(notes_root)
+    if not current:
+        current = "default"
+        set_current_profile_name(notes_root, current)
+    profile_path = profiles_dir / f"{current}.json"
+    profile_path.write_text(json.dumps(settings, indent=2))
+    # Legacy mirror for compatibility
+    legacy_path = notes_root / "dojo_settings.json"
+    legacy_path.write_text(json.dumps(settings, indent=2))
 
 
 def prompt_choice(prompt: str, default: str, allowed: set[str]) -> str:
@@ -3262,6 +3519,56 @@ def prompt_choice(prompt: str, default: str, allowed: set[str]) -> str:
             f"Invalid choice. Pick one of: {', '.join(sorted(allowed_lower))}. "
             f"Default is {default}; press Enter to accept it."
         )
+
+
+def sanitize_profile_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "", name).strip()
+
+
+def ensure_profile_selected(notes_root: Path) -> str:
+    """
+    Ensure there is an active profile; prompt to create or switch if none.
+    """
+    notes_root.mkdir(parents=True, exist_ok=True)
+    profiles_dir = get_profiles_dir(notes_root)
+    current = get_current_profile_name(notes_root)
+    if current and (profiles_dir / f"{current}.json").exists():
+        return current
+
+    existing = list_profiles(notes_root)
+    console.print(Panel("No active profile found. Create or select a profile to continue.", border_style="cyan"))
+
+    if not existing:
+        name = sanitize_profile_name(Prompt.ask("Enter a profile name", default="engineer"))
+        if not name:
+            name = "engineer"
+        set_current_profile_name(notes_root, name)
+        save_settings(notes_root, {"user_name": name})
+        console.print(f"[green]Profile '{name}' created and set active.[/green]")
+        return name
+
+    console.print("Existing profiles:")
+    for prof in existing:
+        console.print(f" - {prof}")
+    choice = Prompt.ask(
+        "Choose: 1) Create new  2) Use existing",
+        choices=["1", "2"],
+        default="2",
+        show_choices=False,
+    )
+    if choice == "1":
+        name = sanitize_profile_name(Prompt.ask("Enter a profile name", default="engineer"))
+        if not name:
+            name = "engineer"
+        set_current_profile_name(notes_root, name)
+        save_settings(notes_root, {"user_name": name})
+        console.print(f"[green]Profile '{name}' created and set active.[/green]")
+        return name
+    else:
+        target = Prompt.ask("Enter profile name to use", choices=existing, default=existing[0])
+        set_current_profile_name(notes_root, target)
+        console.print(f"[green]Switched to profile '{target}'.[/green]")
+        return target
 
 
 def collect_entries(kata_root: Path, notes_root: Path, since: datetime) -> list[tuple[str, str, str]]:
@@ -3328,7 +3635,9 @@ def peek_kata_summary(project_dir: Path, notes_root: Path) -> None:
     readme = (project_dir / "README.md").read_text().splitlines() if (project_dir / "README.md").exists() else []
     mission = (project_dir / "MISSION.md").read_text().splitlines() if (project_dir / "MISSION.md").exists() else []
     log_hint = last_lines(project_dir / "LOG.md", 3) if (project_dir / "LOG.md").exists() else "No project log yet."
-    mission_excerpt = "\n".join(mission[:8]) if mission else "MISSION.md missing."
+    def strip_heading(line: str) -> str:
+        return re.sub(r"^#+\s*", "", line).strip()
+    mission_excerpt = "\n".join(strip_heading(line) for line in mission[:8]) if mission else "MISSION.md missing."
     readme_title = readme[0].lstrip("# ").strip() if readme else "README missing."
 
     body = (
