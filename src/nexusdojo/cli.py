@@ -8,10 +8,12 @@ import argparse
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import sys
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -610,6 +612,8 @@ def handle_watch(args: argparse.Namespace) -> int:
 
     start_time = time.time()
     timer_end_time = (start_time + countdown_minutes * 60) if countdown_minutes else None
+    pulse_frames = ["[dim]●[/dim]", "[cyan]●[/cyan]", "[bright_cyan]●[/bright_cyan]", "[cyan]●[/cyan]"]
+    pulse_idx = 0
 
     console.print(Panel(
         f"Watching [cyan]{project_dir}[/cyan]\n"
@@ -666,7 +670,18 @@ def handle_watch(args: argparse.Namespace) -> int:
         if timer_end_time:
             # Main loop for countdown
             while time.time() < timer_end_time:
+                frame = pulse_frames[pulse_idx % len(pulse_frames)]
+                pulse_idx += 1
+                remaining_seconds = max(0, int(timer_end_time - time.time()))
+                rem_mins, rem_secs = divmod(remaining_seconds, 60)
+                console.print(
+                    f"\r{frame} Watch active... remaining {rem_mins:02}:{rem_secs:02}",
+                    end="",
+                    highlight=False,
+                    soft_wrap=False,
+                )
                 time.sleep(1)
+            console.print()  # newline after pulse line
             console.clear()
             console.print(Panel(
                 "[bold green]🔔 Pomodoro Session Ended! 🔔[/bold green]\n"
@@ -681,6 +696,14 @@ def handle_watch(args: argparse.Namespace) -> int:
         else:
             # No timer, just watch indefinitely
             while True:
+                frame = pulse_frames[pulse_idx % len(pulse_frames)]
+                pulse_idx += 1
+                console.print(
+                    f"\r{frame} Watch active... waiting for changes.",
+                    end="",
+                    highlight=False,
+                    soft_wrap=False,
+                )
                 time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
@@ -1529,6 +1552,11 @@ def handle_start(args: argparse.Namespace) -> int:
             tests_node.add("🐍 test_edge_cases.py")
     
     console.print(Panel(tree, title="Scaffold Generated", border_style="green"))
+    mission_preview_path = target_dir / "MISSION.md"
+    if mission_preview_path.exists():
+        console.print("[bold]MISSION.md[/bold]")
+        type_out_text("\n".join(mission_preview_path.read_text().splitlines()[:10]))
+        console.print()
 
     console.print(f"Created kata at [green]{target_dir}[/green]")
     if scaffolded:
@@ -1605,11 +1633,16 @@ def launch_session(project_dir: Path) -> None:
             watch_cmd_parts.extend(["--countdown-minutes", str(countdown_minutes)])
 
         # 1. Split window horizontally, cd to project, run dojo watch
-        subprocess.run([
+        split_result = subprocess.run([
             "tmux", "split-window", "-h", 
             "-c", str(project_dir), 
             " ".join(watch_cmd_parts) # Pass as a single string for tmux
-        ])
+        ], capture_output=True, text=True)
+        if split_result.returncode != 0:
+            console.print("[red]Tmux split failed; watch pane not started.[/red]")
+            if split_result.stderr:
+                console.print(f"[dim]{summarize_failure_output(split_result.stderr)}[/dim]")
+            console.print(f"[yellow]Run manually:[/yellow] {' '.join(watch_cmd_parts)}")
         
         # 2. Open nvim in the current pane
         # We replace the current process with nvim to keep the flow clean
@@ -2382,6 +2415,79 @@ def get_next_level_threshold(xp: int) -> int:
     return 9999
 
 
+def type_out_text(text: str, delay: float = 0.01) -> None:
+    """
+    Render text with a lightweight typing effect (line-paced).
+    """
+    for line in text.splitlines():
+        console.print(line)
+        pause = min(0.05, delay * max(1, len(line) / 6))
+        time.sleep(pause)
+
+
+def start_matrix_rain(pillar: str, mode: str, duration: float = 1.6) -> tuple[threading.Event, threading.Thread]:
+    """
+    Stream faint debug-style lines while an AI task runs.
+    """
+    stop_event = threading.Event()
+    debug_templates = [
+        "> [DEBUG] weakest='{pillar}' variance={var:.2f}",
+        "> [TRACE] template='{mode}' noise={noise:.2f}",
+        "> [DEBUG] scoring rubric: fluency={score:.2f}",
+        "> [SYS] hint_sampler={hint:.2f} beam={beam}",
+        "> [DEBUG] mission synth pass={pass_no}",
+        "> [ANALYZE] context tokens={tokens}",
+    ]
+    def worker() -> None:
+        start_time = time.time()
+        lines = 0
+        while not stop_event.is_set() and time.time() - start_time < duration and lines < 18:
+            template = random.choice(debug_templates)
+            line = template.format(
+                pillar=pillar,
+                mode=mode,
+                var=random.random(),
+                noise=random.random(),
+                score=random.uniform(0.2, 0.95),
+                hint=random.uniform(0.1, 0.9),
+                beam=random.randint(2, 6),
+                pass_no=random.randint(1, 3),
+                tokens=random.randint(240, 1480),
+            )
+            console.print(f"[dim]{line}[/dim]")
+            lines += 1
+            time.sleep(0.12)
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def stop_matrix_rain(stop_event: threading.Event, thread: threading.Thread) -> None:
+    """
+    Halt the matrix rain helper.
+    """
+    stop_event.set()
+    thread.join(timeout=0.3)
+
+
+def run_boot_diagnostics(kata_root: Path, notes_root: Path) -> None:
+    """
+    Show a short boot-up diagnostic before the menu renders.
+    """
+    steps = [
+        ("CONNECTING", "Verifying local environment...", "OK"),
+        ("NETWORK", f"Ollama ({DEFAULT_IDEA_MODEL})...", "LATENCY 4ms"),
+        ("PROFILE", f"Loading {notes_root.name or 'profile'}...", "LOADED"),
+        ("SYSTEM", f"Mounting workspace at {kata_root.name}...", "OK"),
+    ]
+    console.clear()
+    for label, message, status in steps:
+        console.print(f"[dim][ {label:^10} ][/dim] {message} [green]{status}[/green]")
+        time.sleep(0.18)
+    time.sleep(0.2)
+    console.clear()
+
+
 def handle_menu(_: argparse.Namespace) -> int:
     """
     Interactive menu for common tasks (Rich UI).
@@ -2394,6 +2500,7 @@ def handle_menu(_: argparse.Namespace) -> int:
         return run_onboarding(notes_root)
 
     force_lobby_view = False
+    run_boot_diagnostics(kata_root, notes_root)
 
     while True:
         import time # Import time locally here
@@ -2752,19 +2859,30 @@ def handle_menu(_: argparse.Namespace) -> int:
             # Reuse the vars we loaded at start of loop
             current_xp = skills.get(weakest_pillar, 0)
             level_title, _ = get_level_info(current_xp)
+            # Map skill level to difficulty hint for idea picker
+            difficulty = "foundation"
+            if level_title == "Journeyman":
+                difficulty = "proficient"
+            elif level_title in {"Expert", "Master"}:
+                difficulty = "stretch"
             
             target_mode = "fastapi" if weakest_pillar == "api" else "script"
 
-            idea, used_fallback = pick_idea_with_hints(
-                provider=DEFAULT_IDEA_PROVIDER,
-                model=DEFAULT_IDEA_MODEL,
-                kata_root=Path(DEFAULT_KATA_ROOT),
-                notes_root=Path(DEFAULT_NOTES_ROOT),
-                pillar_hint=weakest_pillar,
-                level_hint=difficulty,
-                mode_hint=target_mode,
-                offline=False,
-            )
+            console.print("[dim]> Analyzing skill profile...[/dim]")
+            rain_stop, rain_thread = start_matrix_rain(weakest_pillar, target_mode)
+            try:
+                idea, used_fallback = pick_idea_with_hints(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=Path(DEFAULT_KATA_ROOT),
+                    notes_root=Path(DEFAULT_NOTES_ROOT),
+                    pillar_hint=weakest_pillar,
+                    level_hint=difficulty,
+                    mode_hint=target_mode,
+                    offline=False,
+                )
+            finally:
+                stop_matrix_rain(rain_stop, rain_thread)
             
             if not idea:
                 console.print("[red]Could not generate an idea.[/red]")
@@ -2960,16 +3078,17 @@ def peek_kata_summary(project_dir: Path, notes_root: Path) -> None:
     readme = (project_dir / "README.md").read_text().splitlines() if (project_dir / "README.md").exists() else []
     mission = (project_dir / "MISSION.md").read_text().splitlines() if (project_dir / "MISSION.md").exists() else []
     log_hint = last_lines(project_dir / "LOG.md", 3) if (project_dir / "LOG.md").exists() else "No project log yet."
-    mission_excerpt = "\n".join(mission[:6]) if mission else "MISSION.md missing."
+    mission_excerpt = "\n".join(mission[:8]) if mission else "MISSION.md missing."
     readme_title = readme[0].lstrip("# ").strip() if readme else "README missing."
 
     body = (
         f"[bold]Path:[/bold] {project_dir.resolve()}\n"
         f"[bold]README:[/bold] {readme_title}\n\n"
-        f"[bold]MISSION excerpt:[/bold]\n{mission_excerpt}\n\n"
         f"[bold]Recent log:[/bold]\n{log_hint}"
     )
     console.print(Panel(body, title=f"📄 {project_dir.name}", border_style="cyan"))
+    console.print("[bold]MISSION excerpt:[/bold]")
+    type_out_text(mission_excerpt)
 
 
 def build_idea_prompt(
