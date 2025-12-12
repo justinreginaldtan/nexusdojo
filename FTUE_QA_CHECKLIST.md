@@ -54,7 +54,6 @@
         *   The prompt "[dim]Launching in 3 seconds... (Ctrl+C to cancel)[/dim]" appears.
 
 2.  **Launch Environment:**
-    *   **Action:** If prompted "Start Pomodoro session? (25 min) [y/n]", type `n` and Enter. (To keep it simple for the first run).
     *   **Expected:**
         *   If `tmux` is running, your terminal splits:
             *   Left Pane: `nvim` opens with `main.py` and `MISSION.md` in buffers.

@@ -15,14 +15,16 @@ import shutil
 import sys
 import subprocess
 import threading
+import termios
 import time
 import urllib.error
 import urllib.request
+import tty
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
@@ -551,11 +553,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_NOTES_ROOT),
         help="Directory for shared notes/logs.",
     )
-    watch_parser.add_argument(
-        "--countdown-minutes",
-        type=int,
-        help="Start a Pomodoro countdown in watch mode (e.g., 25).",
-    )
     watch_parser.set_defaults(func=handle_watch)
 
     play_parser = subparsers.add_parser(
@@ -592,15 +589,11 @@ def build_parser() -> argparse.ArgumentParser:
 def handle_watch(args: argparse.Namespace) -> int:
     """
     Watch for file changes and auto-run dojo check.
-    Includes an optional Pomodoro timer.
     """
     import time
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
 
-    # Get countdown minutes from args, default to None (no timer)
-    countdown_minutes = getattr(args, "countdown_minutes", None)
-    
     kata_root = Path(args.root).expanduser()
     if args.project:
         project_dir = kata_root / args.project
@@ -612,53 +605,299 @@ def handle_watch(args: argparse.Namespace) -> int:
         return 1
 
     start_time = time.time()
-    timer_end_time = (start_time + countdown_minutes * 60) if countdown_minutes else None
-    pulse_frames = ["[dim]●[/dim]", "[cyan]●[/cyan]", "[bright_cyan]●[/bright_cyan]", "[cyan]●[/cyan]"]
-    pulse_idx = 0
+    last_tick = start_time
+    elapsed_seconds = 0.0
+    last_status = "Idle"
+    last_checked = None
+    last_duration = None
+    last_failure_detail: Optional[dict[str, str]] = None
+    last_failure_sig: Optional[str] = None
+    repeat_fail_count = 0
+    history: list[str] = []
+    sensei_block: Optional[Panel] = None
+    live_ref: Optional[Live] = None
+    input_mode = False
+    running_tests = False
+    paused = False
+    stop_keys = threading.Event()
+    run_lock = threading.Lock()
+    toast_msg = ""
+    toast_until = 0.0
 
-    console.print(Panel(
-        f"Watching [cyan]{project_dir}[/cyan]\n"
-        "Edit any .py file to trigger tests.\n"
-        "Press [bold]Ctrl+C[/bold] to stop.",
-        title="👀 SENSEI WATCH MODE",
-        border_style="blue"
-    ))
+    def set_toast(msg: str, duration: float = 3.0) -> None:
+        """
+        Show a short-lived status message without breaking the layout.
+        """
+        nonlocal toast_msg, toast_until
+        toast_msg = msg
+        toast_until = time.time() + duration
 
-    def play_system_sound():
-        # Play a simple beep on macOS, fall back to print
+    def live_pause() -> None:
+        if live_ref and hasattr(live_ref, "pause"):
+            try:
+                live_ref.pause()
+            except Exception:
+                pass
+
+    def live_resume() -> None:
+        if live_ref and hasattr(live_ref, "resume"):
+            try:
+                live_ref.resume()
+            except Exception:
+                pass
+
+    def build_banner(elapsed_secs: int, paused_banner: bool) -> Panel:
+        mins, secs = divmod(elapsed_secs, 60)
+        watch_display = f"Current Kata > {project_dir.name}"
+        keys_line = "p: pause   r: run test   a: ask   c: clear   q: quit"
+        pause_tag = "[yellow](paused) [/yellow]" if paused_banner else ""
+        grid = Table.grid(expand=True)
+        grid.add_row(f"[center]{watch_display}[/center]")
+        grid.add_row("Edit any .py file to trigger tests.")
+        grid.add_row(f"[dim]{keys_line}[/dim]")
+        return Panel(
+            grid,
+            border_style="blue",
+            title="[bold]Sensei Watch[/bold]",
+            title_align="center",
+            subtitle=f"[dim]{pause_tag}{mins:02}:{secs:02}[/dim]",
+            subtitle_align="right",
+        )
+
+    def render_status(status: str) -> None:
+        """
+        Render a single-line status without spamming newlines (Rich-aware).
+        """
+        console.print(status, end="\r", soft_wrap=False, overflow="crop", highlight=False)
         try:
-            subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"], check=True, stderr=subprocess.PIPE)
+            console.file.flush()
         except Exception:
-            console.print("[bold yellow]🔔 Pomodoro Time's Up! 🔔[/bold yellow]", style="blink")
+            pass
+
+    def parse_failure_summary(output: str) -> dict[str, str]:
+        """
+        Extract a short failure summary from unittest output.
+        """
+        lines = output.splitlines()
+        test_name = ""
+        snippet = ""
+        for line in lines:
+            if line.startswith(("FAIL:", "ERROR:")):
+                test_name = line.split(":", 1)[1].strip()
+                break
+        file_line = ""
+        for line in lines:
+            if line.strip().startswith("File ") and ", line " in line:
+                file_line = line.strip()
+                break
+        if not snippet and lines:
+            snippet = "\n".join(lines[:4]).strip()
+        return {"test": test_name or "unknown", "line": file_line or (lines[0] if lines else ""), "snippet": snippet}
+
+    def update_history(status_char: str) -> None:
+        history.append(status_char)
+        while len(history) > 6:
+            history.pop(0)
+
+    def history_bar() -> str:
+        if not history:
+            return ""
+        return "[" + " ".join(history) + "]"
+
+    def run_single_test(test_name: str) -> int:
+        """
+        Run a specific test by name inside the project.
+        """
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest", test_name],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        output = result.stderr or result.stdout
+        style = "green" if result.returncode == 0 else "red"
+        console.print(Panel(summarize_failure_output(output), title=f"Test {test_name}", border_style=style))
+        return result.returncode
+
+    def build_sensei_hint(question: str) -> Panel:
+        """
+        Build a short hint using local context (mission + last failure + streak).
+        """
+        mission_excerpt = ""
+        mission_path = project_dir / "MISSION.md"
+        if mission_path.exists():
+            mission_excerpt = "\n".join(mission_path.read_text().splitlines()[:6])
+        lines = []
+        if question:
+            lines.append(f"[bold]Question:[/bold] {question}")
+            lines.append("")
+        if last_failure_detail:
+            fail_name = last_failure_detail.get("test", "")
+            fail_line = last_failure_detail.get("line", "")
+            snippet = summarize_text(last_failure_detail.get("snippet", ""), 160)
+            if fail_name or fail_line:
+                lines.append(f"[bold]Last fail:[/bold] {fail_name} {fail_line}".strip())
+            if snippet:
+                lines.append(snippet)
+            lines.append("")
+        if history:
+            lines.append(f"[bold]Recent runs:[/bold] {' '.join(history)}")
+            lines.append("")
+        guidance = fallback_hint(question)
+        if guidance:
+            cleaned: list[str] = []
+            for line in guidance.splitlines():
+                if re.search(r"re-?read your question", line, re.IGNORECASE):
+                    continue
+                cleaned.append(line.strip())
+            cleaned = [ln for ln in cleaned if ln]
+            if cleaned:
+                bullet_lines = "\n".join(f"- {ln}" for ln in cleaned)
+                lines.append(f"[bold]Sensei:[/bold]\n{bullet_lines}")
+        body = "\n".join([ln for ln in lines if ln.strip() != ""])
+        return Panel(body, title="💡 Sensei Hint", border_style="yellow")
+
+    def execute_check(single_test: Optional[str] = None) -> None:
+        """
+        Run either full check or a single test, with state tracking.
+        """
+        nonlocal last_status, last_checked, last_duration, last_failure_detail, last_failure_sig, repeat_fail_count, running_tests
+        if paused or stop_keys.is_set():
+            return
+        if not run_lock.acquire(blocking=False):
+            return
+        try:
+            running_tests = True
+            started_at = time.time()
+            live_pause()
+            if single_test:
+                rc = run_single_test(single_test)
+                failure_info = None
+                output_signature = single_test
+            else:
+                check_args = argparse.Namespace(**vars(args))
+                check_args.auto_log = True
+                check_args.collect_failure = True
+                result = handle_check(check_args)
+                if isinstance(result, tuple):
+                    rc, failure_info = result
+                else:
+                    rc, failure_info = result, None
+                output_signature = ""
+                if failure_info:
+                    output_signature = failure_info.get("test", "") + failure_info.get("line", "")
+            last_duration = f"{time.time() - started_at:.1f}s"
+            last_status = "Passed" if rc == 0 else "Failed"
+            last_checked = datetime.now().strftime("%H:%M:%S")
+            update_history("✓" if rc == 0 else "✗")
+
+            if rc != 0:
+                detail = None
+                if not single_test and failure_info:
+                    detail = failure_info
+                elif single_test:
+                    detail = {"test": single_test, "snippet": "", "line": ""}
+                if detail:
+                    sig = output_signature or (detail.get("test", "") + detail.get("line", ""))
+                    if sig and sig == last_failure_sig:
+                        repeat_fail_count += 1
+                        console.print(f"[yellow]Same failure x{repeat_fail_count}.[/yellow]")
+                    else:
+                        repeat_fail_count = 1
+                        last_failure_sig = sig
+                        snippet = detail.get("snippet", "").strip()
+                        name = detail.get("test", "unknown")
+                        line = detail.get("line", "")
+                        console.print(Panel(
+                            f"{line}\n\n{snippet}",
+                            title=f"❌ Last failing test: {name}",
+                            border_style="red",
+                        ))
+                    last_failure_detail = detail
+            else:
+                repeat_fail_count = 0
+                last_failure_detail = None
+                last_failure_sig = None
+        finally:
+            live_resume()
+            running_tests = False
+            run_lock.release()
+
+    def keyboard_listener() -> None:
+        """
+        Listen for lightweight controls: p=toggle pause, r=run tests, a=ask sensei, c=clear, q=quit.
+        """
+        nonlocal paused, sensei_block, live_ref, input_mode
+        fd = None
+        orig_attrs = None
+        try:
+            fd = sys.stdin.fileno()
+            orig_attrs = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            fd = None
+            orig_attrs = None
+        try:
+            while not stop_keys.is_set():
+                try:
+                    ch = sys.stdin.read(1)
+                except Exception:
+                    break
+                if not ch:
+                    continue
+                if ch.lower() == "p":
+                    paused = not paused
+                elif ch.lower() == "c":
+                    console.clear()
+                    set_toast("Cleared")
+                    sensei_block = None
+                elif ch.lower() == "r":
+                    set_toast("Running tests...")
+                    execute_check()
+                elif ch.lower() == "a":
+                    set_toast("Ask Sensei")
+                    input_mode = True
+                    live_pause()
+                    question = Prompt.ask("Ask Sensei (Enter to cancel)", default="")
+                    live_resume()
+                    input_mode = False
+                    if question.strip():
+                        hint = build_sensei_hint(question.strip())
+                        payload = hint.renderable if isinstance(hint, Panel) else hint
+                        sensei_block = Panel(
+                            payload,
+                            title="Sensei Response",
+                            subtitle=datetime.now().strftime("%H:%M:%S"),
+                            subtitle_align="right",
+                            border_style="yellow",
+                            title_align="center",
+                        )
+                        set_toast("Sensei response ready")
+                    else:
+                        set_toast("Ask cancelled")
+                elif ch.lower() == "q":
+                    stop_keys.set()
+                    observer.stop()
+                    break
+        finally:
+            if orig_attrs and fd is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, orig_attrs)
+                except Exception:
+                    pass
 
     class TestRunnerHandler(FileSystemEventHandler):
         def on_modified(self, event):
+            nonlocal last_status, last_checked, last_duration
             if event.src_path.endswith(".py"):
                 # Small debounce to avoid double-firing on some editors
                 time.sleep(0.1)
-                console.clear()
-                
-                # --- Timer Display ---
-                elapsed_display = int(time.time() - start_time)
-                mins, secs = divmod(elapsed_display, 60)
-                elapsed_str = f"Elapsed: {mins:02}:{secs:02}"
-                
-                timer_status_str = f"[bold]FOCUS TIMER:[/bold] [cyan]{elapsed_str}[/cyan]"
-                if timer_end_time:
-                    remaining_seconds = max(0, int(timer_end_time - time.time()))
-                    rem_mins, rem_secs = divmod(remaining_seconds, 60)
-                    timer_status_str += f" [bold red]Remaining: {rem_mins:02}:{rem_secs:02}[/bold red]"
-                
-                console.print(Panel(timer_status_str, box=box.MINIMAL, style="dim"))
-                # --- End Timer Display ---
-                
-                console.print(f"[dim]Change detected in {Path(event.src_path).name}...[/dim]")
-                # We call handle_check but suppress the return code to keep watching
+                if paused or stop_keys.is_set():
+                    return
+                set_toast(f"Change detected in {Path(event.src_path).name}")
                 try:
-                    # Pass auto_log=True to avoid blocking prompts in watch mode
-                    check_args = argparse.Namespace(**vars(args))
-                    check_args.auto_log = True
-                    handle_check(check_args)
+                    last_status = "Running"
+                    execute_check()
                 except Exception as e:
                     console.print(f"[red]Error running check: {e}[/red]")
 
@@ -667,48 +906,54 @@ def handle_watch(args: argparse.Namespace) -> int:
     observer.schedule(event_handler, str(project_dir), recursive=True)
     observer.start()
 
+    # Keyboard controls
+    key_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    key_thread.start()
+
     try:
-        if timer_end_time:
-            # Main loop for countdown
-            while time.time() < timer_end_time:
-                frame = pulse_frames[pulse_idx % len(pulse_frames)]
-                pulse_idx += 1
-                remaining_seconds = max(0, int(timer_end_time - time.time()))
-                rem_mins, rem_secs = divmod(remaining_seconds, 60)
-                console.print(
-                    f"\r{frame} Watch active... remaining {rem_mins:02}:{rem_secs:02}",
-                    end="",
-                    highlight=False,
-                    soft_wrap=False,
-                )
-                time.sleep(1)
-            console.print()  # newline after pulse line
-            console.clear()
-            console.print(Panel(
-                "[bold green]🔔 Pomodoro Session Ended! 🔔[/bold green]\n"
-                "Time for a break, Reginald.",
-                title="⏱️ SESSION COMPLETE",
-                border_style="green",
-                box=box.DOUBLE
-            ))
-            play_system_sound()
-            # If timer ends, stop watching
-            observer.stop()
-        else:
-            # No timer, just watch indefinitely
-            while True:
-                frame = pulse_frames[pulse_idx % len(pulse_frames)]
-                pulse_idx += 1
-                console.print(
-                    f"\r{frame} Watch active... waiting for changes.",
-                    end="",
-                    highlight=False,
-                    soft_wrap=False,
-                )
-                time.sleep(1)
+        with Live(console=console, refresh_per_second=6, screen=True) as live:
+            live_ref = live
+            while not stop_keys.is_set():
+                now = time.time()
+                if not paused:
+                    elapsed_seconds += now - last_tick
+                last_tick = now
+                if input_mode or running_tests:
+                    time.sleep(0.1)
+                    continue
+                elapsed_display = int(elapsed_seconds)
+                if last_checked:
+                    status_line = f"last {last_status}"
+                    if last_duration:
+                        status_line += f" ({last_duration})"
+                    status_line += f" at {last_checked}"
+                    bar = history_bar()
+                    if bar:
+                        status_line = f"{status_line} {bar}".strip()
+                    status_renderable = Text(status_line or " ", justify="left")
+                else:
+                    status_renderable = Spinner("dots", text="Listening…")
+                toast_line = ""
+                if toast_msg and time.time() < toast_until:
+                    toast_line = toast_msg
+                else:
+                    toast_msg = ""
+                    toast_until = 0.0
+                blocks = [
+                    build_banner(elapsed_display, paused),
+                    status_renderable,
+                ]
+                if sensei_block:
+                    blocks.append(sensei_block)
+                blocks.append(Text(toast_line or " ", style="dim", justify="left"))
+                live.update(Group(*blocks))
+                time.sleep(1.0)
     except KeyboardInterrupt:
         observer.stop()
         console.print("\n[blue]Watch stopped.[/blue]")
+    finally:
+        # Clear the status line before exit
+        console.print(" " * 120, end="\r", soft_wrap=False, overflow="crop", highlight=False)
     observer.join()
     return 0
 
@@ -737,6 +982,8 @@ def handle_check(args: argparse.Namespace) -> int:
     auto_log = getattr(args, "auto_log", False)
     
     console.print(f"[bold blue]Running tests for:[/bold blue] {project_dir.name}...")
+
+    collect_failure = bool(getattr(args, "collect_failure", False))
 
     # Run unittest
     result = subprocess.run(
@@ -805,7 +1052,7 @@ def handle_check(args: argparse.Namespace) -> int:
                 root=str(kata_root),
                 notes_root=str(args.notes_root)
             ))
-        return 0
+        return (0, None) if collect_failure else 0
 
     else:
         # Failure Case
@@ -839,6 +1086,24 @@ def handle_check(args: argparse.Namespace) -> int:
             border_style="yellow",
             padding=(1, 2)
         ))
+        if collect_failure:
+            fail_lines = (error_out or "").splitlines()
+            test_name = ""
+            first_line = ""
+            for line in fail_lines:
+                if line.startswith(("FAIL:", "ERROR:")):
+                    test_name = line.split(":", 1)[1].strip()
+                    break
+            for line in fail_lines:
+                if line.strip().startswith("File ") and ", line " in line:
+                    first_line = line.strip()
+                    break
+            failure_detail = {
+                "test": test_name or "unknown",
+                "line": first_line or (fail_lines[0] if fail_lines else ""),
+                "snippet": summarize_failure_output(error_out, max_lines=6, max_chars=600),
+            }
+            return 1, failure_detail
         return 1
 
 
@@ -1613,13 +1878,6 @@ def launch_session(project_dir: Path) -> None:
     # Check for TMUX
     in_tmux = os.environ.get("TMUX") is not None
     
-    # Pomodoro prompt
-    countdown_minutes = None
-    if in_tmux: # Only ask for pomodoro if we can do the split pane experience
-        pomodoro_choice = Prompt.ask("Start Pomodoro session? (25 min) [y/n]", choices=["y", "n"], default="y")
-        if pomodoro_choice.lower() == "y":
-            countdown_minutes = 25
-
     if in_tmux:
         console.print("[green]Tmux detected. Configuring split-pane environment...[/green]")
         
@@ -1630,8 +1888,6 @@ def launch_session(project_dir: Path) -> None:
             "--root", str(project_dir.parent),
             "--notes-root", str(DEFAULT_NOTES_ROOT),
         ]
-        if countdown_minutes:
-            watch_cmd_parts.extend(["--countdown-minutes", str(countdown_minutes)])
 
         watch_cmd_str = " ".join(shlex.quote(part) for part in watch_cmd_parts)
         watch_cmd_str += "; rc=$?; echo \"[watch pane exited code ${rc}]\"; read -r _"
@@ -1661,11 +1917,7 @@ def launch_session(project_dir: Path) -> None:
         
     else:
         console.print("[yellow]Tip: Run 'dojo menu' inside tmux for auto-split 'Watch Mode'.[/yellow]")
-        if countdown_minutes:
-            console.print("[red]Pomodoro timer requires Watch Mode, which is best in tmux.[/red]")
-            console.print("[dim]Launching Neovim without timer...[/dim]")
-        else:
-            console.print("[dim]Launching Neovim...[/dim]")
+        console.print("[dim]Launching Neovim...[/dim]")
         os.chdir(project_dir)
         subprocess.run(["nvim", "main.py", "MISSION.md"])
 
@@ -2622,16 +2874,10 @@ def handle_menu(_: argparse.Namespace) -> int:
                     menu_options.insert(-1, ("⬅️ Back to Kata Tools", "back_to_kata"))
 
             # Render Panel
-            # Get session time for header
-            session_start_time = getattr(console, "_session_start_time", time.time())
-            elapsed_seconds = int(time.time() - session_start_time)
-            session_mins, session_secs = divmod(elapsed_seconds, 60)
-            session_header = f"[Session: {session_mins:02}:{session_secs:02}]"
-
             panel = Panel(
                 main_layout,
                 title="[bold white]NEXUS DOJO[/bold white]",
-                subtitle=f"[italic grey62]Mastery through repetition[/italic grey62] {session_header}",
+                subtitle=f"[italic grey62]Mastery through repetition[/italic grey62]",
                 border_style="blue",
                 box=box.ROUNDED,
                 padding=(1, 2)
