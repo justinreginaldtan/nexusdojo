@@ -10,6 +10,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import sys
 import subprocess
@@ -1625,24 +1626,27 @@ def launch_session(project_dir: Path) -> None:
         # Build the command for the new pane (dojo watch)
         watch_cmd_parts = [
             sys.executable, "-m", "nexusdojo.cli", "watch",
-            "--project", project_dir.name,
+            project_dir.name,
             "--root", str(project_dir.parent),
-            "--notes-root", str(DEFAULT_NOTES_ROOT)
+            "--notes-root", str(DEFAULT_NOTES_ROOT),
         ]
         if countdown_minutes:
             watch_cmd_parts.extend(["--countdown-minutes", str(countdown_minutes)])
+
+        watch_cmd_str = " ".join(shlex.quote(part) for part in watch_cmd_parts)
+        watch_cmd_str += "; rc=$?; echo \"[watch pane exited code ${rc}]\"; read -r _"
 
         # 1. Split window horizontally, cd to project, run dojo watch
         split_result = subprocess.run([
             "tmux", "split-window", "-h", 
             "-c", str(project_dir), 
-            " ".join(watch_cmd_parts) # Pass as a single string for tmux
+            watch_cmd_str
         ], capture_output=True, text=True)
         if split_result.returncode != 0:
             console.print("[red]Tmux split failed; watch pane not started.[/red]")
             if split_result.stderr:
                 console.print(f"[dim]{summarize_failure_output(split_result.stderr)}[/dim]")
-            console.print(f"[yellow]Run manually:[/yellow] {' '.join(watch_cmd_parts)}")
+            console.print(f"[yellow]Run manually:[/yellow] {watch_cmd_str}")
         
         # 2. Open nvim in the current pane
         # We replace the current process with nvim to keep the flow clean
