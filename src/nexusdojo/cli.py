@@ -715,6 +715,114 @@ def get_last_session(kata_root: Path) -> Optional[str]:
     except Exception:
         return None
 
+
+def difficulty_label(level: int) -> str:
+    """
+    Human-readable difficulty label for catalog listings.
+    """
+    return f"Level {level}"
+
+
+def build_kata_catalog(kata_root: Path) -> list[dict[str, Any]]:
+    """
+    Curated kata catalog with categories and difficulty.
+    Falls back to defaults for any discovered slugs not in the mapping.
+    """
+    curated = [
+        {"slug": "hello-personalized-world", "title": "Hello Personalized World", "category": "fundamentals", "difficulty": 1},
+        {"slug": "age-calculator", "title": "Age Calculator", "category": "fundamentals", "difficulty": 1},
+        {"slug": "temperature-converter", "title": "Temperature Converter", "category": "fundamentals", "difficulty": 1},
+        {"slug": "basic-calculator", "title": "Basic Calculator", "category": "fundamentals", "difficulty": 1},
+        {"slug": "coin-flip", "title": "Coin Flip Simulator", "category": "fundamentals", "difficulty": 1},
+        {"slug": "calculate-the-sum-of-a-list-of-numbers", "title": "Sum of Numbers", "category": "fundamentals", "difficulty": 1},
+        {"slug": "log-file-cleaner", "title": "Log File Cleaner", "category": "fundamentals", "difficulty": 2},
+        {"slug": "password-validator", "title": "Password Validator", "category": "fundamentals", "difficulty": 2},
+        {"slug": "csv-cleaner", "title": "CSV Cleaner", "category": "cli/data", "difficulty": 2},
+        {"slug": "test-project", "title": "Test Project", "category": "misc", "difficulty": 2},
+        {"slug": "inventory-aggregator", "title": "Inventory Aggregator", "category": "fundamentals", "difficulty": 3},
+        {"slug": "todo-class", "title": "Todo Class", "category": "oop", "difficulty": 3},
+        {"slug": "snack-orders-api", "title": "Snack Orders API", "category": "fastapi", "difficulty": 3},
+        {"slug": "chain-of-thought-calculator", "title": "Chain-of-Thought Calculator", "category": "langchain", "difficulty": 3},
+        {"slug": "weather-news-agent", "title": "Weather + News Agent", "category": "langchain/tools", "difficulty": 3},
+        {"slug": "faq-retriever", "title": "FAQ Retriever", "category": "rag", "difficulty": 3},
+        {"slug": "jwt-notes", "title": "JWT Notes API", "category": "fastapi/auth", "difficulty": 4},
+        {"slug": "doc-qa-harness", "title": "Doc QA Harness", "category": "rag/eval", "difficulty": 4},
+        {"slug": "retrying-http-client", "title": "Retrying HTTP Client", "category": "reliability", "difficulty": 4},
+        {"slug": "mcp-todo-capability", "title": "MCP Todo Capability", "category": "mcp/fastapi", "difficulty": 5},
+        {"slug": "mcp-stocks-lookup", "title": "MCP Stocks Lookup", "category": "mcp/fastapi", "difficulty": 5},
+        # LeetCode-style (added below in dedicated menu)
+        {"slug": "leetcode-two-sum", "title": "LeetCode Two Sum", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-valid-parentheses", "title": "LeetCode Valid Parentheses", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-merge-sorted-arrays", "title": "LeetCode Merge Sorted Arrays", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-max-subarray", "title": "LeetCode Max Subarray", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-binary-search", "title": "LeetCode Binary Search", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-palindrome-linked-list", "title": "LeetCode Palindrome Linked List", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-min-stack", "title": "LeetCode Min Stack", "category": "leetcode/easy", "difficulty": 1},
+        {"slug": "leetcode-top-k-frequent", "title": "LeetCode Top K Frequent", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-longest-substring-no-repeat", "title": "LeetCode Longest Substring", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-group-anagrams", "title": "LeetCode Group Anagrams", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-kth-smallest-bst", "title": "LeetCode Kth Smallest BST", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-course-schedule", "title": "LeetCode Course Schedule", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-word-ladder", "title": "LeetCode Word Ladder", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-rotate-image", "title": "LeetCode Rotate Image", "category": "leetcode/medium", "difficulty": 3},
+        {"slug": "leetcode-median-two-sorted", "title": "LeetCode Median Two Arrays", "category": "leetcode/hard", "difficulty": 5},
+        {"slug": "leetcode-n-queens", "title": "LeetCode N Queens", "category": "leetcode/hard", "difficulty": 5},
+        {"slug": "leetcode-min-window-substring", "title": "LeetCode Min Window", "category": "leetcode/hard", "difficulty": 5},
+        {"slug": "leetcode-serialize-btree", "title": "LeetCode Serialize Tree", "category": "leetcode/hard", "difficulty": 5},
+        {"slug": "leetcode-trapping-rain-water", "title": "LeetCode Trapping Rain", "category": "leetcode/hard", "difficulty": 5},
+        {"slug": "leetcode-word-search-ii", "title": "LeetCode Word Search II", "category": "leetcode/hard", "difficulty": 5},
+        {"slug": "leetcode-lfu-cache", "title": "LeetCode LFU Cache", "category": "leetcode/hard", "difficulty": 5},
+    ]
+    by_slug = {item["slug"]: item for item in curated}
+
+    if kata_root.exists():
+        for entry in kata_root.iterdir():
+            if entry.is_dir() and not entry.name.startswith(".") and entry.name not in by_slug:
+                by_slug[entry.name] = {
+                    "slug": entry.name,
+                    "title": entry.name.replace("-", " ").title(),
+                    "category": "misc",
+                    "difficulty": 3,
+                }
+
+    catalog = list(by_slug.values())
+    catalog.sort(key=lambda item: (item.get("difficulty", 3), item.get("title", "").lower()))
+    return catalog
+
+
+def build_leetcode_catalog() -> list[dict[str, Any]]:
+    """
+    Return curated LeetCode-style katas grouped by difficulty.
+    """
+    items = [
+        # Easy
+        {"slug": "leetcode-two-sum", "title": "Two Sum Variant", "difficulty": 1},
+        {"slug": "leetcode-valid-parentheses", "title": "Valid Parentheses", "difficulty": 1},
+        {"slug": "leetcode-merge-sorted-arrays", "title": "Merge Sorted Arrays", "difficulty": 1},
+        {"slug": "leetcode-max-subarray", "title": "Max Subarray", "difficulty": 1},
+        {"slug": "leetcode-binary-search", "title": "Binary Search", "difficulty": 1},
+        {"slug": "leetcode-palindrome-linked-list", "title": "Palindrome Linked List", "difficulty": 1},
+        {"slug": "leetcode-min-stack", "title": "Min Stack", "difficulty": 1},
+        # Medium
+        {"slug": "leetcode-top-k-frequent", "title": "Top K Frequent Elements", "difficulty": 3},
+        {"slug": "leetcode-longest-substring-no-repeat", "title": "Longest Substring No Repeat", "difficulty": 3},
+        {"slug": "leetcode-group-anagrams", "title": "Group Anagrams", "difficulty": 3},
+        {"slug": "leetcode-kth-smallest-bst", "title": "Kth Smallest in BST", "difficulty": 3},
+        {"slug": "leetcode-course-schedule", "title": "Course Schedule", "difficulty": 3},
+        {"slug": "leetcode-word-ladder", "title": "Word Ladder Length", "difficulty": 3},
+        {"slug": "leetcode-rotate-image", "title": "Rotate Image", "difficulty": 3},
+        # Hard
+        {"slug": "leetcode-median-two-sorted", "title": "Median of Two Sorted Arrays", "difficulty": 5},
+        {"slug": "leetcode-n-queens", "title": "N-Queens", "difficulty": 5},
+        {"slug": "leetcode-min-window-substring", "title": "Minimum Window Substring", "difficulty": 5},
+        {"slug": "leetcode-serialize-btree", "title": "Serialize/Deserialize Binary Tree", "difficulty": 5},
+        {"slug": "leetcode-trapping-rain-water", "title": "Trapping Rain Water", "difficulty": 5},
+        {"slug": "leetcode-word-search-ii", "title": "Word Search II", "difficulty": 5},
+        {"slug": "leetcode-lfu-cache", "title": "LFU Cache", "difficulty": 5},
+    ]
+    items.sort(key=lambda item: (item["difficulty"], item["title"].lower()))
+    return items
+
 def handle_check(args: argparse.Namespace) -> int:
     """
     Run tests for a kata, providing visual feedback and AI diagnosis on failure.
@@ -2936,7 +3044,7 @@ def handle_menu(args: argparse.Namespace) -> int:
 
                 # ═══ HEADER LEFT: Status / Skills ═══
                 h_left = Table.grid(padding=0)
-                h_left.add_column()
+                h_left.add_column(no_wrap=True)
 
                 h_left.add_row(Text.from_markup(f"[bold]{user_name}[/bold]  [{badge_style}] {badge_text} [/{badge_style}]"))
                 h_left.add_row(Text.from_markup(f"[dim]Katas[/dim] {completed_drills}  [dim]·[/dim]  [dim]XP[/dim] {total_xp}"))
@@ -2974,10 +3082,10 @@ def handle_menu(args: argparse.Namespace) -> int:
                     h_right.add_row(Text.from_markup(f"[dim italic]{date_str}[/dim italic]"))
 
                 # ═══ HEADER GRID ═══
-                left_width = max(int(content_width * 0.6), 40)
+                left_width = max(int(content_width * 0.65), 50)
                 right_width = content_width - left_width
                 header = Table.grid(padding=(0, 4))
-                header.add_column(width=left_width)
+                header.add_column(width=left_width, no_wrap=True)
                 header.add_column(width=right_width)
                 header.add_row(h_left, h_right)
 
@@ -3102,42 +3210,123 @@ def handle_menu(args: argparse.Namespace) -> int:
                             console.clear()
                             return -1
 
-                gym_options = ["Quick Train (Random)", "Golden Path (Curated)", "Back"]
-                gym_sel = arrow_select("Gym Mode:", gym_options)
-                if gym_sel == 0:
-                    return handle_start(argparse.Namespace(**vars(args), idea=None, guided=False, yes=False))
-                elif gym_sel == 1:
-                    golden_path = [
-                        ("Level 0: Hello Personalized World", "hello-personalized-world"),
-                        ("Level 0.5: The Age Calculator", "age-calculator"),
-                        ("Level 1: The Temperature Converter", "temperature-converter"),
-                        ("Level 2: The Log File Cleaner", "log-file-cleaner"),
-                        ("Level 3: The Password Validator", "password-validator"),
-                        ("Level 4: The Inventory Aggregator", "inventory-aggregator"),
-                        ("Level 5 (Boss): The Todo Class", "todo-class"),
-                    ]
+                gym_options = [
+                    "Quick Train (Random)",
+                    "Level 1 Katas",
+                    "Level 2 Katas",
+                    "Level 3 Katas",
+                    "Level 4 Katas",
+                    "Level 5 Katas",
+                    "LeetCode (Algorithms)",
+                    "Choose any Kata",
+                    "Back",
+                ]
+
+                catalog = build_kata_catalog(kata_root)
+                level_map: dict[int, list[dict[str, Any]]] = {
+                    lvl: [item for item in catalog if item.get("difficulty") == lvl]
+                    for lvl in range(1, 6)
+                }
+
+                def select_from_level(level_num: int, title: str) -> bool:
+                    entries = level_map.get(level_num, [])
+                    if not entries:
+                        console.print(f"[yellow]No katas mapped for {title} yet.[/yellow]")
+                        time.sleep(1)
+                        return False
                     completed_entries = collect_entries(kata_root, notes_root, datetime.min)
                     completed_slugs = {e[0] for e in completed_entries}
-                    golden_labels = []
-                    for idx, (title, slug) in enumerate(golden_path, 1):
-                        check = "[green]✓[/green] " if slug in completed_slugs else "  "
-                        golden_labels.append(f"{check}[{idx}] {title}")
-                    golden_labels.append("Back")
-                    path_sel = arrow_select("The Golden Path:", golden_labels)
-                    if path_sel == -1 or path_sel == len(golden_labels) - 1:
-                        continue
+                    labels: list[str] = []
+                    for idx, item in enumerate(entries, 1):
+                        check = "[green]✓[/green] " if item["slug"] in completed_slugs else "  "
+                        labels.append(f"{check}[{idx}] {item['title']} ({item['category']})")
+                    labels.append("Back")
+                    sel_idx = arrow_select(title, labels)
+                    if sel_idx == -1 or sel_idx == len(labels) - 1:
+                        return False
                     try:
-                        _, kata_slug = golden_path[path_sel]
-                        project_dir = kata_root / kata_slug
+                        kata_slug = entries[sel_idx]["slug"]
+                    except (ValueError, IndexError):
+                        return False
+                    project_dir = kata_root / kata_slug
+                    if not project_dir.exists():
+                        console.print(f"[bold red]Missing kata:[/bold red] {project_dir}")
+                        Prompt.ask("Press Enter to return")
+                        return False
+                    launch_session(project_dir)
+                    return True
+
+                while True:
+                    gym_sel = arrow_select("Gym Mode:", gym_options)
+                    # Back (q/esc or last option) returns to main menu without dumping you out of Gym flow mid-level.
+                    if gym_sel == -1 or gym_sel == len(gym_options) - 1:
+                        break
+                    if gym_sel == 0:
+                        console.print("[yellow]Quick Train is coming soon (LLM kata generation still being wired up).[/yellow]")
+                        time.sleep(1.2)
+                        continue
+                    if gym_sel == 1:
+                        if select_from_level(1, "Level 1 Katas"):
+                            return 0
+                        continue
+                    if gym_sel == 2:
+                        if select_from_level(2, "Level 2 Katas"):
+                            return 0
+                        continue
+                    if gym_sel == 3:
+                        if select_from_level(3, "Level 3 Katas"):
+                            return 0
+                        continue
+                    if gym_sel == 4:
+                        if select_from_level(4, "Level 4 Katas"):
+                            return 0
+                        continue
+                    if gym_sel == 5:
+                        if select_from_level(5, "Level 5 Katas"):
+                            return 0
+                        continue
+                    if gym_sel == 6:
+                        lc_catalog = build_leetcode_catalog()
+                        lc_options = [
+                            f"[Level {item['difficulty']}] {item['title']}"
+                            for item in lc_catalog
+                        ]
+                        lc_options.append("Back")
+                        sel = arrow_select("LeetCode Katas:", lc_options)
+                        if sel == -1 or sel == len(lc_options) - 1:
+                            continue
+                        try:
+                            chosen = lc_catalog[sel]
+                        except (IndexError, ValueError):
+                            continue
+                        project_dir = kata_root / chosen["slug"]
                         if not project_dir.exists():
                             console.print(f"[bold red]Missing kata:[/bold red] {project_dir}")
                             Prompt.ask("Press Enter to return")
                             continue
                         launch_session(project_dir)
                         return 0
-                    except (ValueError, IndexError):
-                        continue
-                else:
+                    if gym_sel == 7:
+                        options = [
+                            f"[{difficulty_label(item['difficulty'])}] {item['title']} ({item['category']})"
+                            for item in catalog
+                        ]
+                        options.append("Back")
+                        sel = arrow_select("Choose a Kata:", options)
+                        if sel == -1 or sel == len(options) - 1:
+                            continue
+                        try:
+                            selected = catalog[sel]
+                        except (IndexError, ValueError):
+                            continue
+                        project_dir = kata_root / selected["slug"]
+                        if not project_dir.exists():
+                            console.print(f"[bold red]Missing kata:[/bold red] {project_dir}")
+                            Prompt.ask("Press Enter to return")
+                            continue
+                        launch_session(project_dir)
+                        return 0
+                    # Unknown selection; re-show Gym menu.
                     continue
 
             elif choice == "2":

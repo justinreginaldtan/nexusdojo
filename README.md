@@ -15,6 +15,15 @@ NexusDojo is not a bootcamp. It is a local CLI "gym" that forces you to write co
 
 ## 🚀 Quickstart
 
+1. **Install deps**
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install -U pip
+    python -m pip install -r requirements.txt
+    python -m pip install -e .
+    ```
+    Optional but recommended: install `tmux` and `nvim` so `dojo menu` can auto-open the split-pane watch + editor flow.
 1.  **Enter the Dojo:**
     ```bash
     dojo menu
@@ -22,9 +31,13 @@ NexusDojo is not a bootcamp. It is a local CLI "gym" that forces you to write co
     If `dojo` isn't on your PATH, run `./.venv/bin/dojo menu` (or `source .venv/bin/activate` first).
 2.  **Select Your Arena:**
     *   **[1] The Gym:** Choose "Golden Path" for a curated curriculum (Python Basics -> OOP).
-3.  **Code:**
+    *   **LeetCode (Algorithms):** Browse easy/medium/hard algorithm katas.
+3.  **Install kata deps when needed:**
+    *   Core install (one time): `pip install -r requirements.txt && pip install -e .`
+    *   FastAPI/JWT/MCP katas: `pip install -r dojo/<slug>/requirements.txt` (e.g., `snack-orders-api`, `jwt-notes`, `mcp-*`).
+4.  **Code:**
     *   The system opens **Neovim** (Left) and **Turbo Watch** (Right).
-    *   Edit `main.py`. Save. Watch the tests pass instantly.
+    *   Edit `main.py`. Save. Watch the tests pass instantly (`dojo watch` or `python -m unittest` inside the kata).
 
 ## 🛠️ The Stack
 *   **CLI:** Python + Argparse (The engine).

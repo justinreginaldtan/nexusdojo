@@ -1,0 +1,1 @@
+- [2025-12-16 09:42] remembering syntax slowly
