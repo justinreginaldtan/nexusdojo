@@ -1,12 +1,14 @@
-"""Edge-case TODOs for Binary Search."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Binary Search")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_found(self) -> None:
+        self.assertEqual(main.binary_search([-1, 0, 3, 5, 9, 12], 9), 4)
 
+    def test_not_found(self) -> None:
+        self.assertEqual(main.binary_search([-1, 0, 3, 5, 9, 12], 2), -1)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_single_element(self) -> None:
+        self.assertEqual(main.binary_search([1], 1), 0)
+        self.assertEqual(main.binary_search([1], 2), -1)

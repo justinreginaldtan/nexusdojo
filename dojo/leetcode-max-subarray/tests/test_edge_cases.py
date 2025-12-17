@@ -1,12 +1,9 @@
-"""Edge-case TODOs for Max Subarray."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Max Subarray")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_examples(self) -> None:
+        self.assertEqual(main.max_subarray([-2,1,-3,4,-1,2,1,-5,4]), 6)
+        self.assertEqual(main.max_subarray([1]), 1)
+        self.assertEqual(main.max_subarray([-1, -2]), -1)

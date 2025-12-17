@@ -1,12 +1,14 @@
-"""Edge-case TODOs for Group Anagrams."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Group Anagrams")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_groups_anagrams(self) -> None:
+        res = main.group_anagrams(["eat", "tea", "tan", "ate", "nat", "bat"])
+        normalized = {frozenset(group) for group in map(tuple, res)}
+        self.assertIn(frozenset(["eat", "tea", "ate"]), normalized)
+        self.assertIn(frozenset(["tan", "nat"]), normalized)
+        self.assertIn(frozenset(["bat"]), normalized)
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_empty_input(self) -> None:
+        self.assertEqual(main.group_anagrams([]), [])

@@ -1,12 +1,8 @@
-"""Edge-case TODOs for Median of Two Sorted Arrays."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Median of Two Sorted Arrays")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_examples(self) -> None:
+        self.assertEqual(main.find_median_sorted_arrays([1, 3], [2]), 2.0)
+        self.assertEqual(main.find_median_sorted_arrays([1, 2], [3, 4]), 2.5)

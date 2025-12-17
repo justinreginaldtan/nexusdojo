@@ -1,12 +1,13 @@
-"""Edge-case TODOs for Minimum Window Substring."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Minimum Window Substring")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_classic_case(self) -> None:
+        self.assertEqual(main.min_window("ADOBECODEBANC", "ABC"), "BANC")
 
+    def test_single_char(self) -> None:
+        self.assertEqual(main.min_window("a", "a"), "a")
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_no_possible_window(self) -> None:
+        self.assertEqual(main.min_window("a", "aa"), "")

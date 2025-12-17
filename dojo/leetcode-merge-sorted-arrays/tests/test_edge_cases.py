@@ -1,12 +1,11 @@
-"""Edge-case TODOs for Merge Sorted Arrays."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Merge Sorted Arrays")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_merge_sorted_lists(self) -> None:
+        self.assertEqual(main.merge([1, 3, 5], [2, 4]), [1, 2, 3, 4, 5])
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_with_empty_lists(self) -> None:
+        self.assertEqual(main.merge([], [1, 2]), [1, 2])
+        self.assertEqual(main.merge([1, 2], []), [1, 2])

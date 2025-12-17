@@ -1,12 +1,12 @@
-"""Edge-case TODOs for Word Ladder Length."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Word Ladder Length")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_classic_case(self) -> None:
+        length = main.ladder_length("hit", "cog", ["hot","dot","dog","lot","log","cog"])
+        self.assertEqual(length, 5)
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_no_path_returns_zero(self) -> None:
+        length = main.ladder_length("hit", "cog", ["hot","dot","dog","lot","log"])
+        self.assertEqual(length, 0)

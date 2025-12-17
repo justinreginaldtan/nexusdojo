@@ -1,12 +1,21 @@
-"""Edge-case TODOs for Word Search II."""
 import unittest
+import main
+
+
+BOARD = [
+    ["o","a","a","n"],
+    ["e","t","a","e"],
+    ["i","h","k","r"],
+    ["i","f","l","v"],
+]
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Word Search II")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_finds_words(self) -> None:
+        words = ["oath","pea","eat","rain"]
+        found = main.find_words([row[:] for row in BOARD], words)
+        self.assertEqual(set(found), {"oath", "eat"})
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_no_matches(self) -> None:
+        found = main.find_words([row[:] for row in BOARD], ["zzz"])
+        self.assertEqual(found, [])

@@ -1,12 +1,11 @@
-"""Edge-case TODOs for Valid Parentheses."""
 import unittest
+import main
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Valid Parentheses")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_examples(self) -> None:
+        self.assertTrue(main.is_valid("()"))
+        self.assertTrue(main.is_valid("()[]{}"))
+        self.assertFalse(main.is_valid("(]"))
+        self.assertFalse(main.is_valid("([)]"))
+        self.assertFalse(main.is_valid("{"))

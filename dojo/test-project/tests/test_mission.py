@@ -1,19 +1,25 @@
-"""Auto-generated mission tests. Implement these to complete the kata."""
 import unittest
-import main # Assuming main.py contains your logic
+import main
+from tempfile import TemporaryDirectory
+from pathlib import Path
+
 
 class MissionTests(unittest.TestCase):
-    @unittest.skip(f'TODO: Implement for: Each test case should pass')
-    def test_acceptance_criteria_1(self):
-        # Test: Each test case should pass
-        self.fail('Test not implemented yet')
+    def test_setup_creates_files(self):
+        with TemporaryDirectory() as tmpdir:
+            created = main.setup_project_structure(tmpdir)
+            self.assertIsInstance(created, list)
+            self.assertTrue(all(Path(p).exists() for p in created))
 
-    @unittest.skip(f'TODO: Implement for: The script should handle errors gracefully')
-    def test_acceptance_criteria_2(self):
-        # Test: The script should handle errors gracefully
-        self.fail('Test not implemented yet')
+    def test_define_interfaces_normalizes(self):
+        spec = {"User": {"create": "POST /users", "get": "GET /users/{id}"}}
+        normalized = main.define_interfaces(spec)
+        self.assertIn("User", normalized)
+        self.assertIn("create", normalized["User"])
+        self.assertEqual(normalized["User"]["create"], "POST /users")
 
-    @unittest.skip(f'TODO: Implement for: All tests should be documented')
-    def test_acceptance_criteria_3(self):
-        # Test: All tests should be documented
-        self.fail('Test not implemented yet')
+    def test_write_tests_returns_string(self):
+        interfaces = {"User": {"create": "POST /users"}}
+        code = main.write_tests(interfaces)
+        self.assertIsInstance(code, str)
+        self.assertIn("User", code)

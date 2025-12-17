@@ -1,1 +1,2 @@
-# Add third-party dependencies here if your kata needs them.
+fastapi
+httpx

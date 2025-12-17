@@ -63,7 +63,10 @@ Develop a simple command-line calculator in Python that performs addition, subtr
 4. Log your progress: `dojo log <kata-slug> --note "..."`
 5. Once complete: `dojo check` to pass all tests, then log your victory!
 """
+from fastapi import FastAPI, HTTPException
 from typing import Tuple
+
+app = FastAPI()
 
 
 def parse_input(raw: str) -> Tuple[str, float, float]:
@@ -96,6 +99,20 @@ def calculate(operation: str, num1: float, num2: float) -> float:
             raise ValueError("Division by zero")
         return num1 / num2
     raise ValueError(f"Unsupported operation: {operation}")
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/calc")
+def calc(q: str) -> dict:
+    op, a, b = parse_input(q)
+    try:
+        return {"result": calculate(op, a, b)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def main() -> None:

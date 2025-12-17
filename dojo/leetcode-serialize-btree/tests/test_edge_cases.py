@@ -1,12 +1,35 @@
-"""Edge-case TODOs for Serialize/Deserialize Binary Tree."""
 import unittest
+import main
+from collections import deque
+
+
+def bfs_values(root):
+    out = []
+    q = deque([root])
+    while q:
+        node = q.popleft()
+        if node is None:
+            out.append(None)
+            continue
+        out.append(node.val)
+        q.append(node.left)
+        q.append(node.right)
+    # trim trailing None noise
+    while out and out[-1] is None:
+        out.pop()
+    return out
 
 
 class EdgeCases(unittest.TestCase):
-    @unittest.skip("Fill in edge cases for Serialize/Deserialize Binary Tree")
-    def test_edge_cases(self) -> None:
-        self.assertTrue(True)
+    def test_round_trip(self) -> None:
+        root = main.TreeNode(1, main.TreeNode(2), main.TreeNode(3, main.TreeNode(4), main.TreeNode(5)))
+        codec = main.Codec()
+        data = codec.serialize(root)
+        rebuilt = codec.deserialize(data)
+        self.assertEqual(bfs_values(rebuilt), [1, 2, 3, None, None, 4, 5])
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_empty_tree(self) -> None:
+        codec = main.Codec()
+        data = codec.serialize(None)
+        rebuilt = codec.deserialize(data)
+        self.assertIsNone(rebuilt)
