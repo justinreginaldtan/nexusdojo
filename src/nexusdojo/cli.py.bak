@@ -71,45 +71,6 @@ HINT_COOLDOWN_SECONDS = 5
 HINT_MAX_PER_DAY = 9999  # Effectively unlimited
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# KEYBOARD INPUT HELPERS (for arrow key navigation)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def read_key() -> str:
-    """
-    Read a single keypress. Returns special strings for arrow keys.
-    Works on Unix/macOS with termios/tty.
-    """
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        # Handle escape sequences (arrow keys)
-        if ch == '\x1b':
-            ch2 = sys.stdin.read(1)
-            if ch2 == '[':
-                ch3 = sys.stdin.read(1)
-                if ch3 == 'A':
-                    return 'UP'
-                elif ch3 == 'B':
-                    return 'DOWN'
-                elif ch3 == 'C':
-                    return 'RIGHT'
-                elif ch3 == 'D':
-                    return 'LEFT'
-            return 'ESC'
-        elif ch == '\r' or ch == '\n':
-            return 'ENTER'
-        elif ch == '\x03':  # Ctrl+C
-            raise KeyboardInterrupt
-        elif ch == '\x04':  # Ctrl+D
-            return 'EXIT'
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
 def build_parser() -> argparse.ArgumentParser:
     """
     Build the argument parser with subcommands.
@@ -748,12 +709,12 @@ def handle_check(args: argparse.Namespace) -> int:
 
     collect_failure = bool(getattr(args, "collect_failure", False))
 
-    # Run unittest (explicit discovery keeps kata structure consistent)
+    # Run unittest
     result = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"],
+        [sys.executable, "-m", "unittest"],
         cwd=project_dir,
         capture_output=True,
-        text=True,
+        text=True
     )
 
     concise = getattr(args, "concise_mode", False)
@@ -937,18 +898,8 @@ def format_pillar_label(pillar: str) -> str:
     """
     Normalize pillar labels for display (e.g., CLI, API).
     """
-    p = pillar.lower()
-    if p == "cli":
-        return "CLI"
-    elif p == "api":
-        return "API"
-    elif p == "python":
-        return "Python"
-    elif p == "testing":
-        return "Testing"
-    elif p == "mixed":
-        return "Mixed"
-    return pillar.title()
+    mapping = {"cli": "CLI", "api": "API", "python": "Python", "testing": "Testing", "mixed": "Mixed"}
+    return mapping.get(pillar, pillar.title())
 
 
 def summarize_failure_output(output: str, max_lines: int = 20, max_chars: int = 1200) -> str:
@@ -1212,29 +1163,6 @@ def generate_mission_spec(
     return "\n".join(md_lines), acceptance_criteria, fallback_used
 
 
-def build_mission_header_comments(project_dir: Path, max_lines: int = 120, max_chars: int = 4000) -> list[str]:
-    """
-    Read MISSION.md and return a concise commented block for in-file reference.
-    """
-    mission_path = project_dir / "MISSION.md"
-    if not mission_path.exists():
-        return []
-    try:
-        raw_lines = mission_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except Exception:
-        return []
-
-    header = ["# --- MISSION.md (synced for quick reference) ---"]
-    total = 0
-    for line in raw_lines:
-        if len(header) > max_lines or total + len(line) > max_chars:
-            header.append("# ... (see MISSION.md for full brief)")
-            break
-        header.append(f"# {line}")
-        total += len(line)
-    return header
-
-
 def handle_hello(_: argparse.Namespace) -> int:
     """
     Print a short quickstart message.
@@ -1329,7 +1257,7 @@ def handle_settings(args: argparse.Namespace) -> int:
     """
     Settings menu for configuring NexusDojo behavior.
     """
-    notes_root = Path(getattr(args, "notes_root", DEFAULT_NOTES_ROOT))
+    notes_root = Path(args.notes_root)
     settings = load_settings(notes_root)
 
     while True:
@@ -1767,15 +1695,19 @@ def handle_start(args: argparse.Namespace) -> int:
         print("Note: LLM unavailable for mission spec; using curated fallback.", file=sys.stderr)
 
     # Mission Injection Logic
-    mission_header_lines = build_mission_header_comments(target_dir)
+    docstring_mission = "\n".join([line for line in mission_md_content.splitlines() if not line.startswith("# Mission")])
+    mission_header = f'"""{idea_title}\n\nMISSION SPECS:\n{docstring_mission}\n"""\n'
 
     # Prepend mission to existing static main.py
     main_py = target_dir / "main.py"
-    if mission_header_lines and main_py.exists():
+    if main_py.exists():
         original_content = main_py.read_text()
-        already_injected = original_content.lstrip().startswith("# --- MISSION.md")
-        if not already_injected:
-            main_py.write_text("\n".join(mission_header_lines) + "\n\n" + original_content.lstrip("\n"))
+        # Remove any leading docstring to avoid duplicate mission headers.
+        if original_content.startswith('"""'):
+            end_idx = original_content.find('"""', 3)
+            if end_idx != -1:
+                original_content = original_content[end_idx + 3 :].lstrip()
+        main_py.write_text(mission_header + original_content)
 
     # Write metadata for progression tracking
     (target_dir / ".kata.json").write_text(json.dumps({
@@ -2360,7 +2292,6 @@ def handle_continue(args: argparse.Namespace) -> int:
     """
     kata_root = Path(args.root).expanduser()
     notes_root = Path(args.notes_root).expanduser()
-    interactive = sys.stdin.isatty()
     recent = latest_activity(kata_root, notes_root)
     if not recent:
         print("No activity found yet. Start a kata with `dojo start`.", file=sys.stderr)
@@ -2385,9 +2316,6 @@ def handle_continue(args: argparse.Namespace) -> int:
         last_log = last_lines(log_hint, 3)
         if last_log:
             print(f"- Recent log lines:\n{last_log}")
-    if interactive and project_dir.exists():
-        console.print("[dim]Launching editor + watch...[/dim]")
-        launch_session(project_dir)
     return 0
 
 
@@ -2546,20 +2474,6 @@ def find_active_kata_dir(cwd: Path) -> Optional[Path]:
     return None
 
 def format_pillar_label(pillar: str) -> str:
-    """
-    Normalize pillar labels for display (e.g., CLI, API).
-    """
-    p = pillar.lower()
-    if p == "cli":
-        return "CLI"
-    elif p == "api":
-        return "API"
-    elif p == "python":
-        return "Python"
-    elif p == "testing":
-        return "Testing"
-    elif p == "mixed":
-        return "Mixed"
     return pillar.title()
 
 def count_completed_drills(kata_root: Path, notes_root: Path) -> int:
@@ -2767,12 +2681,6 @@ def run_boot_diagnostics(kata_root: Path, notes_root: Path) -> None:
     console.clear()
 
 
-
-
-
-
-
-
 def print_splash():
     """Prints a premium ASCII banner with a slight delay."""
     banner = """
@@ -2785,388 +2693,560 @@ def print_splash():
     [/bold cyan]"""
     console.clear()
     console.print(Align.center(banner))
-    console.print(Align.center("[dim]Initializing System...[/dim]"))
+    console.print(Align.center("[dim]System Online... v0.2[/dim]"))
     time.sleep(1.0) # The "Premium" pause
+
 def handle_menu(args: argparse.Namespace) -> int:
     """
-    Interactive menu for common tasks (Rich UI - Dashboard).
+    Main interactive menu for the Dojo.
     """
-    print_splash() # Splash
-
-    # Normalize args with defaults so downstream handlers have the expected attributes.
-    if not hasattr(args, "root"):
-        args.root = str(DEFAULT_KATA_ROOT)
-    if not hasattr(args, "notes_root"):
-        args.notes_root = str(DEFAULT_NOTES_ROOT)
-
-    kata_root = Path(getattr(args, "notes_root", DEFAULT_KATA_ROOT)) # Fallback if args.root missing
-    # Actually, args.root is usually kata root. notes_root is notes.
-    # Let fix the args access properly.
-    kata_root = Path(getattr(args, "root", DEFAULT_KATA_ROOT))
-    notes_root = Path(getattr(args, "notes_root", DEFAULT_NOTES_ROOT))
-    
-    notes_root.mkdir(parents=True, exist_ok=True) 
-    
-    if not (notes_root / "skills.json").exists():
-        return run_onboarding(notes_root)
-
-    force_lobby_view = False
-    # run_boot_diagnostics(kata_root, notes_root) # Disabled to avoid potential crash if missing
-
-    # Require an active profile before continuing
-    ensure_profile_selected(notes_root)
-
-    # Track if entrance animation has played this session
-    entrance_played = False
+    # Show splash only if not returning from a sub-task (heuristic)
+    # For now, just show it.
+    print_splash() 
 
     while True:
-        import time
-        try:
+        console.clear()
+        
+        # --- Header ---
+        notes_root = Path(getattr(args, "notes_root", DEFAULT_NOTES_ROOT))
+        skills = load_skills(notes_root)
+        xp = sum(skills.values())
+        level_title, _ = get_level_info(xp)
+        settings = load_settings(notes_root)
+        user_name = settings.get("user_name", "Engineer")
+        
+        header_grid = Table.grid(expand=True)
+        header_grid.add_column(justify="left")
+        header_grid.add_column(justify="right")
+        header_grid.add_row(
+            f"[bold white]NEXUS DOJO[/bold white]", 
+            f"[cyan]{user_name}[/cyan] | [yellow]{level_title} ({xp} XP)[/yellow]"
+        )
+        
+        console.print(Panel(header_grid, style="blue"))
+
+        # --- The Arenas ---
+        menu_grid = Table.grid(expand=True, padding=(0, 2))
+        menu_grid.add_column(style="bold cyan", width=4)
+        menu_grid.add_column(style="white")
+        
+        menu_grid.add_row("", "")
+        menu_grid.add_row("1", "🏋️  THE GYM [dim](Drills & Algorithms)[/dim]")
+        menu_grid.add_row("", "   [dim]Short, focused exercises to build muscle memory.[/dim]")
+        menu_grid.add_row("", "")
+        menu_grid.add_row("2", "🔨  THE WORKSHOP [dim](Projects)[/dim]")
+        menu_grid.add_row("", "   [dim]Build complete systems from scratch.[/dim]")
+        menu_grid.add_row("", "")
+        menu_grid.add_row("3", "⚔️  BOSS BATTLE [dim](Assessment)[/dim]")
+        menu_grid.add_row("", "   [dim]Timed challenges to prove your mastery.[/dim]")
+        
+        console.print(Panel(menu_grid, title="[bold]SELECT YOUR ARENA[/bold]", border_style="cyan"))
+
+        # --- Utilities ---
+        utils_grid = Table.grid(expand=True, padding=(0, 2))
+        utils_grid.add_column(style="bold white", width=4)
+        utils_grid.add_column()
+        
+        last_slug = get_last_session(Path(args.root))
+        resume_label = f"Resume '{last_slug}'" if last_slug else "Resume Last"
+        
+        utils_grid.add_row("4", f"📜  {resume_label}")
+        utils_grid.add_row("5", "📊  Profile & Stats")
+        utils_grid.add_row("6", "⚙️  Settings")
+        utils_grid.add_row("7", "❓  Help")
+        utils_grid.add_row("8", "🚪  Exit")
+        
+        console.print(Panel(utils_grid, title="[dim]SYSTEM[/dim]", border_style="white"))
+
+        choice = Prompt.ask("[bold]> [/bold]", choices=["1", "2", "3", "4", "5", "6", "7", "8"], show_choices=False)
+
+        if choice == "1":
+            # THE GYM SUB-MENU
+            gym_choice = Prompt.ask(
+                "Gym Mode:\n[1] Quick Train (Random)\n[2] Golden Path (Curated)\n[c] Cancel", 
+                choices=["1", "2", "c"], default="1"
+            )
+            if gym_choice == "1":
+                # Quick Train
+                return handle_start(argparse.Namespace(**vars(args), idea=None, guided=False, yes=False))
+            elif gym_choice == "2":
+                # Golden Path
+                # For now, hardcode the golden path list or read from file
+                golden_path = [
+                    "Level 0: Hello Personalized World",
+                    "Level 0.5: The Age Calculator",
+                    "Level 1: The Temperature Converter",
+                    "Level 2: The Log File Cleaner",
+                    "Level 3: The Password Validator",
+                    "Level 4: The Inventory Aggregator",
+                    "Level 5 (Boss): The Todo Class"
+                ]
+                console.print("\n[bold]The Golden Path:[/bold]")
+                for idx, title in enumerate(golden_path, 1):
+                    console.print(f"[{idx}] {title}")
+                
+                path_idx = Prompt.ask("Select Drill", default="1")
+                try:
+                    selected_title = golden_path[int(path_idx)-1]
+                    # Strip "Level X: " prefix for cleaner slug
+                    clean_idea = selected_title.split(": ", 1)[-1] if ": " in selected_title else selected_title
+                    return handle_start(argparse.Namespace(
+                        **vars(args), 
+                        idea=clean_idea, 
+                        template="script", 
+                        level="foundation",
+                        yes=True # Auto-confirm
+                    ))
+                except (ValueError, IndexError):
+                    console.print("[red]Invalid selection.[/red]")
+                    time.sleep(1)
+
+        elif choice == "2":
+            console.print("[yellow]The Workshop is under construction. Stick to the Gym for today![/yellow]")
+            Prompt.ask("Press Enter")
+            
+        elif choice == "3":
+             console.print("[red]You are not ready for the Boss Battle yet.[/red]")
+             Prompt.ask("Press Enter")
+
+        elif choice == "4":
+             return handle_continue(args)
+             
+        elif choice == "5":
+            handle_info(args) # Reusing info as profile for now
+            Prompt.ask("Press Enter")
+
+        elif choice == "6":
+            handle_settings(args)
+
+        elif choice == "7":
+            handle_help(args)
+            
+        elif choice == "8":
             console.clear()
-
-            # ═══ ENTRANCE ANIMATION (optional, <300ms) ═══
-            settings_check = load_settings(notes_root)
-            show_animation = settings_check.get("menu_animation", True)
-
-            if show_animation and not entrance_played:
-                # Subtle line-by-line fade-in effect
-                console.print()
-                time.sleep(0.05)
-                console.print(Align.center("[dim]·[/dim]"))
-                time.sleep(0.05)
-                console.print(Align.center("[dim]· ·[/dim]"))
-                time.sleep(0.05)
-                console.print(Align.center("[dim]· · ·[/dim]"))
-                time.sleep(0.1)
-                console.clear()
-                entrance_played = True
-            # Gather context refresh on every loop
-            # active_kata_dir = find_active_kata_dir(Path.cwd()) # This might not exist in your version yet
-            # Let assume we are in lobby unless specified
-            active_kata_dir = None
-            if (Path.cwd() / "MISSION.md").exists():
-                 active_kata_dir = Path.cwd()
-            
-            in_kata_context = active_kata_dir is not None and not force_lobby_view
-
-            skills = load_skills(notes_root)
-            settings = load_settings(notes_root)
-            user_name = settings.get("user_name", "Engineer")
-            recent_entries = collect_entries(kata_root, notes_root, datetime.min)
-            
-            valid_skills = {k: v for k, v in skills.items() if k != "mixed"}
-            
-            # Calculate derived stats
-            total_xp = sum(v for k, v in valid_skills.items())
-            completed_drills = count_completed_drills(kata_root, notes_root)
-            # heatmap = get_streak_heatmap(notes_root, days=7) # Might fail if missing helper
-            heatmap = "[dim]Streak tracking...[/dim]" 
-            
-            if valid_skills:
-                strongest_pillar = max(valid_skills, key=valid_skills.get)
-                weakest_pillar = min(valid_skills, key=valid_skills.get)
-            else: 
-                strongest_pillar = "python"
-                weakest_pillar = "python"
-            
-            strongest_level, _ = get_level_info(skills.get(strongest_pillar, 0))
-            weakest_level, _ = get_level_info(skills.get(weakest_pillar, 0))
+            console.print("[blue]Session terminated.[/blue]")
+            return 0
 
 
-            # --- Dashboard Layout (Refactored) ---
 
-            resume_slug = get_last_session(kata_root)
-
-            # ═══ MENU ITEMS DEFINITION ═══
-            menu_items = [
-                {"key": "1", "label": "The Gym", "desc": "drills & practice", "action": "gym"},
-                {"key": "2", "label": "The Workshop", "desc": "build projects", "action": "workshop"},
-                {"key": "3", "label": "Boss Battle", "desc": "test your skills", "action": "boss"},
-            ]
+            resume_slug, resume_dir = resolve_last_kata(kata_root, notes_root)
+            resume_label = "Resume Last Kata"
             if resume_slug:
-                menu_items.append({"key": "4", "label": f"Resume: {resume_slug}", "desc": "", "action": "resume"})
+                resume_label = f"Resume Last Kata ({resume_slug})"
+            else:
+                resume_label += " (none yet)"
 
-            # Divider index (after core actions)
-            divider_after = len(menu_items)
+            tutorial_pending = is_first_time_user(kata_root, notes_root)
 
-            menu_items.extend([
-                {"key": "5", "label": "Profile", "desc": "", "action": "profile"},
-                {"key": "6", "label": "Settings", "desc": "", "action": "settings"},
-                {"key": "7", "label": "Help", "desc": "", "action": "help"},
-                {"key": "8", "label": "Exit", "desc": "", "action": "exit"},
-            ])
+            # --- Menu Options ---
+            if tutorial_pending:
+                menu_options = [
+                    ("Start Tutorial", "start_tutorial"),
+                    ("Profile & History", "profile_history"),
+                    ("Help & Workflow", "help"),
+                    ("Settings", "settings"),
+                    ("Exit", "exit"),
+                ]
+            elif in_kata_context:
+                menu_options = [
+                    ("Sensei Check (Run Tests)", "check"),
+                    ("Sensei Watch Mode", "watch"),
+                    ("Get Unstuck (Hint)", "hint"),
+                    ("Peek This Kata (README/LOG)", "peek_current"),
+                    ("Reset Kata", "reset_kata"),
+                    ("Request Solution (Zero XP)", "solve_kata"),
+                    ("Return to Lobby Menu", "return_lobby"),
+                ]
+            else:
+                menu_options = [
+                    ("Quick Train", "quick_train"),
+                    ("Start New Session", "start_auto"),
+                    (resume_label, "resume"),
+                    ("Return to Any Kata", "return_any_kata"),
+                    ("Profile & History", "profile_history"),
+                    ("Help & Workflow", "help"),
+                    ("Settings", "settings"),
+                    ("Exit", "exit"),
+                ]
+                if force_lobby_view and active_kata_dir:
+                    menu_options.insert(-1, ("⬅️ Back to Kata Tools", "back_to_kata"))
 
-            # ═══ CONTEXT BADGE COLORS ═══
-            def get_context_style(kata_dir):
-                """Return badge style based on context."""
-                if kata_dir:
-                    return "black on cyan", kata_dir.name[:18]
-                return "white on grey30", "LOBBY"
+            # Render Panel
+            panel = Panel(
+                main_layout,
+                title="[bold white]NEXUS DOJO[/bold white]",
+                subtitle=f"[italic grey62]Mastery through repetition[/italic grey62]",
+                border_style="blue",
+                box=box.ROUNDED,
+                padding=(1, 2)
+            )
+            console.print(panel)
+            console.print()
 
-            badge_style, badge_text = get_context_style(active_kata_dir)
-            prompt_color = "cyan" if active_kata_dir else "grey50"
-
-            # ═══ BUILD MENU RENDERABLE ═══
-            def get_skill_state(xp: int) -> str:
-                if xp >= 50:
-                    return "practiced"
-                elif xp > 0:
-                    return "touched"
+            for idx, (label, _) in enumerate(menu_options, start=1):
+                if idx == 1 and label == "Start Tutorial":
+                    display = f"{idx}) {label} (!)"
                 else:
-                    return "not started"
-
-            # Mantra (fixed for session to avoid flicker on minute change)
-            from datetime import datetime as dt
-            mantras = [
-                "Train deliberately.",
-                "Small reps. Real mastery.",
-                "Show up. Ship code.",
-                "Consistency over intensity.",
-                "One kata at a time.",
-                "The path is the practice.",
-            ]
-            session_mantra = mantras[dt.now().minute % len(mantras)]
-
-            def build_menu(selected_idx: int) -> Group:
-                """Two-column HEADER (status | memory) + single-column MENU below, stretched."""
-
-                # ═══ CONTENT WIDTH ═══
-                terminal_width = console.width
-                content_width = max(60, terminal_width - 4)
-
-                # ═══ HEADER LEFT: Status / Skills ═══
-                h_left = Table.grid(padding=0)
-                h_left.add_column()
-
-                h_left.add_row(Text.from_markup(f"[bold]{user_name}[/bold]  [{badge_style}] {badge_text} [/{badge_style}]"))
-                h_left.add_row(Text.from_markup(f"[dim]Katas[/dim] {completed_drills}  [dim]·[/dim]  [dim]XP[/dim] {total_xp}"))
-                h_left.add_row("")
-
-                skills_table = Table.grid(padding=(0, 2))
-                skills_table.add_column(width=18)
-                skills_table.add_column(justify="right")
-
-                for pillar, xp in skills.items():
-                    if pillar == "mixed":
-                        continue
-                    state_label = get_skill_state(xp)
-                    skills_table.add_row(
-                        Text.from_markup(f"  [dim]{format_pillar_label(pillar)}[/dim]"),
-                        Text.from_markup(f"[dim]{state_label}[/dim]"),
-                    )
-
-                h_left.add_row(skills_table)
-
-                # ═══ HEADER RIGHT: Last Activity ═══
-                h_right = Table.grid(padding=0)
-                h_right.add_column()
-
-                if recent_entries:
-                    last = recent_entries[-1]
-                    proj, ts, note = last
-                    date_str = ts.split(' ')[0]
-                    kata_name = proj.replace('-', ' ')
-                    h_right.add_row(Text.from_markup("[dim]Last session:[/dim]"))
-                    h_right.add_row(Text.from_markup(f"[white]{kata_name}[/white]"))
-                    if note and note.strip():
-                        h_right.add_row(Text.from_markup(f"[dim]→ {summarize_text(note, 28)}[/dim]"))
-                    h_right.add_row("")
-                    h_right.add_row(Text.from_markup(f"[dim italic]{date_str}[/dim italic]"))
-
-                # ═══ HEADER GRID ═══
-                left_width = max(int(content_width * 0.6), 40)
-                right_width = content_width - left_width
-                header = Table.grid(padding=(0, 4))
-                header.add_column(width=left_width)
-                header.add_column(width=right_width)
-                header.add_row(h_left, h_right)
-
-                # ═══ MENU (single column) ═══
-                menu_grid = Table.grid(padding=0)
-                menu_grid.add_column(width=content_width)
-
-                menu_label_width = max(len(item["label"]) for item in menu_items) + 2
-
-                for i, item in enumerate(menu_items):
-                    if i == divider_after:
-                        menu_grid.add_row("")
-                    is_selected = (i == selected_idx)
-                    label = item["label"].ljust(menu_label_width)
-                    desc = item["desc"]
-                    if is_selected:
-                        desc_markup = f"[dim]{desc}[/dim]" if desc else ""
-                        row = f"[cyan]›[/cyan] [bold white]{label}[/bold white]"
-                        if desc_markup:
-                            row += f"  {desc_markup}"
-                    else:
-                        if desc:
-                            row = f"  [dim]{label}  {desc}[/dim]"
-                        else:
-                            row = f"  [dim]{label}[/dim]"
-                    menu_grid.add_row(Text.from_markup(row))
-
-                # ═══ CONTENT CONTAINER (centered) ═══
-                content = Table.grid(padding=0)
-                content.add_column(width=content_width)
-                content.add_row(header)
-                content.add_row("")
-                content.add_row(Align.center(Text.from_markup(f"[italic]{session_mantra}[/italic]"), width=content_width))
-                content.add_row("")
-                content.add_row(Text.from_markup(f"[grey30]{'-' * content_width}[/grey30]"))
-                content.add_row("")
-                content.add_row(menu_grid)
-                content.add_row("")
-                content.add_row(Align.center(Text.from_markup("[grey37]↑↓ select · enter confirm · q quit[/grey37]"), width=content_width))
-
-                # ═══ ASSEMBLE ═══
-                lines = []
-                lines.append("")
-                lines.append(Align.center("[bold white]N E X U S   D O J O[/bold white]"))
-                lines.append("")
-                lines.append(Align.left(content))
-
-                return Group(*lines)
-
-            # ═══ RENDER FUNCTION ═══
-            first_render = True
-            def render_menu(selected_idx: int):
-                nonlocal first_render
-                console.show_cursor(False)
-                if first_render:
-                    console.clear()
-                    first_render = False
+                    display = f"{idx}) {label}"
+                console.print(f" [bold cyan]{display}[/bold cyan]")
+            
+            console.print()
+            console.print(f"[italic grey50]Select an option [1-{len(menu_options)}]:[/italic grey50]", end=" ")
+            
+            choice = input().strip()
+            
+            # Map input to action
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(menu_options):
+                    action = menu_options[idx - 1][1]
                 else:
-                    # Move cursor to home position without clearing (no flicker)
-                    print("\033[H", end="", flush=True)
-                console.print(build_menu(selected_idx))
-
-            # ═══ SELECTION LOOP ═══
-            selected_idx = 0
-            choice = None
-            render_menu(selected_idx)
-
-            while True:
-                key = read_key()
-
-                if key == 'UP':
-                    selected_idx = (selected_idx - 1) % len(menu_items)
-                    render_menu(selected_idx)
-                elif key == 'DOWN':
-                    selected_idx = (selected_idx + 1) % len(menu_items)
-                    render_menu(selected_idx)
-                elif key == 'ENTER':
-                    choice = menu_items[selected_idx]["key"]
-                    break
-                elif key in '12345678':
-                    for i, item in enumerate(menu_items):
-                        if item["key"] == key:
-                            choice = key
-                            break
-                    else:
-                        continue
-                    break
-                elif key == 'q' or key == 'Q' or key == 'EXIT':
-                    choice = "8"
-                    break
-                elif key == 'ESC':
+                    console.print("[red]Invalid selection.[/red]")
+                    time.sleep(1)
                     continue
+            except ValueError:
+                continue
+        # except Exception as e:
+        #     console.print(f"[bold red]CRITICAL MENU ERROR: {e}[/bold red]")
+        #     import traceback
+        #     console.print(traceback.format_exc())
+        #     # Add a pause so you can read the error before the loop clears the screen
+        #     Prompt.ask("Press Enter to retry...")
+        #     continue
 
-            # Restore cursor after selection
-            console.show_cursor(True)
-            console.clear()
+        # --- Dispatcher ---
+        if action == "exit":
+            console.print(f"[blue]See you next time, {user_name}.[/blue]")
+            return 0
+            
+        if action == "profile_history":
+            handle_history(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
+            
+        elif action == "help":
+            handle_help(argparse.Namespace())
 
-            if choice == "1":
-                def arrow_select(title: str, options: list[str]) -> int:
-                    sel = 0
-                    console.show_cursor(False)
-                    while True:
-                        console.clear()
-                        console.print(f"\n[bold]{title}[/bold]\n")
-                        for i, opt in enumerate(options):
-                            if i == sel:
-                                console.print(Text.from_markup(f"[cyan]›[/cyan] [bold white]{opt}[/bold white]"))
-                            else:
-                                console.print(Text.from_markup(f"  [dim]{opt}[/dim]"))
-                        console.print("\n[grey37]↑↓ select · enter confirm · q back[/grey37]")
-                        key = read_key()
-                        if key == "UP":
-                            sel = (sel - 1) % len(options)
-                        elif key == "DOWN":
-                            sel = (sel + 1) % len(options)
-                        elif key == "ENTER":
-                            console.show_cursor(True)
-                            console.clear()
-                            return sel
-                        elif key in ("q", "Q", "ESC", "EXIT"):
-                            console.show_cursor(True)
-                            console.clear()
-                            return -1
+        elif action == "settings":
+            handle_settings(argparse.Namespace(notes_root=str(notes_root)))
 
-                gym_options = ["Quick Train (Random)", "Golden Path (Curated)", "Back"]
-                gym_sel = arrow_select("Gym Mode:", gym_options)
-                if gym_sel == 0:
-                    return handle_start(argparse.Namespace(**vars(args), idea=None, guided=False, yes=False))
-                elif gym_sel == 1:
-                    golden_path = [
-                        ("Level 0: Hello Personalized World", "hello-personalized-world"),
-                        ("Level 0.5: The Age Calculator", "age-calculator"),
-                        ("Level 1: The Temperature Converter", "temperature-converter"),
-                        ("Level 2: The Log File Cleaner", "log-file-cleaner"),
-                        ("Level 3: The Password Validator", "password-validator"),
-                        ("Level 4: The Inventory Aggregator", "inventory-aggregator"),
-                        ("Level 5 (Boss): The Todo Class", "todo-class"),
-                    ]
-                    completed_entries = collect_entries(kata_root, notes_root, datetime.min)
-                    completed_slugs = {e[0] for e in completed_entries}
-                    golden_labels = []
-                    for idx, (title, slug) in enumerate(golden_path, 1):
-                        check = "[green]✓[/green] " if slug in completed_slugs else "  "
-                        golden_labels.append(f"{check}[{idx}] {title}")
-                    golden_labels.append("Back")
-                    path_sel = arrow_select("The Golden Path:", golden_labels)
-                    if path_sel == -1 or path_sel == len(golden_labels) - 1:
-                        continue
-                    try:
-                        _, kata_slug = golden_path[path_sel]
-                        project_dir = kata_root / kata_slug
-                        if not project_dir.exists():
-                            console.print(f"[bold red]Missing kata:[/bold red] {project_dir}")
-                            Prompt.ask("Press Enter to return")
-                            continue
-                        launch_session(project_dir)
-                        return 0
-                    except (ValueError, IndexError):
-                        continue
-                else:
-                    continue
+        elif action == "start_tutorial":
+            tutorial_dir = ensure_tutorial_kata(kata_root)
+            console.print("[dim]Launching tutorial...[/dim]")
+            launch_session(tutorial_dir)
 
-            elif choice == "2":
-                console.print("[yellow]Workshop under construction.[/yellow]")
+        elif action == "check":
+            target_root = str(active_kata_dir.parent if active_kata_dir else kata_root)
+            target_project = active_kata_dir.name if active_kata_dir else None
+            handle_check(argparse.Namespace(
+                project=target_project,
+                root=target_root,
+                notes_root=str(notes_root),
+                truncate_output=True
+            ))
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "watch":
+            target_root = str(active_kata_dir.parent if active_kata_dir else kata_root)
+            target_project = active_kata_dir.name if active_kata_dir else None
+            handle_watch(argparse.Namespace(
+                project=target_project,
+                root=target_root,
+                notes_root=str(notes_root)
+            ))
+            
+        elif action == "hint":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
                 time.sleep(1)
-            elif choice == "3":
-                console.print("[red]Not ready for Boss Battle.[/red]")
-                time.sleep(1)
-            elif choice == "4":
-                return handle_continue(args)
-            elif choice == "5":
-                handle_info(args)
-                Prompt.ask("Press Enter to return")
-            elif choice == "6":
-                handle_settings(args)
-            elif choice == "7":
-                handle_help(args)
-            elif choice == "8":
-                console.clear()
-                console.print("[blue]Session terminated.[/blue]")
-                return 0
+                continue
+            question = Prompt.ask("Question focus (optional)", default="")
+            handle_hint(
+                argparse.Namespace(
+                    project=active_kata_dir.name,
+                    question=question,
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    root=str(active_kata_dir.parent),
+                    notes_root=str(notes_root),
+                    dry_run=False,
+                    offline=False,
+                )
+            )
+            Prompt.ask("\nPress Enter to return to menu")
 
-        except Exception as e:
-            console.print(f"[bold red]CRITICAL MENU ERROR: {e}[/bold red]")
-            import traceback
-            console.print(traceback.format_exc())
-            Prompt.ask("Press Enter to retry...")
+        elif action == "peek_current":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                time.sleep(1)
+                continue
+            peek_kata_summary(active_kata_dir, notes_root)
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "reset_kata":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                time.sleep(1)
+                continue
+            handle_reset(argparse.Namespace(project=active_kata_dir.name, root=str(active_kata_dir.parent)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "solve_kata":
+            if not active_kata_dir:
+                console.print("[bold red]No active kata detected here.[/bold red]")
+                time.sleep(1)
+                continue
+            handle_solve(argparse.Namespace(project=active_kata_dir.name, root=str(active_kata_dir.parent)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "return_lobby":
+            force_lobby_view = True
             continue
 
+        elif action == "back_to_kata":
+            force_lobby_view = False
+            continue
+
+        elif action == "play":
+            handle_play(argparse.Namespace())
+            
+        elif action == "solve":
+            project = Prompt.ask("Kata slug")
+            handle_solve(argparse.Namespace(project=project, root=str(kata_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "reset":
+            project = Prompt.ask("Kata slug")
+            handle_reset(argparse.Namespace(project=project, root=str(kata_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "dashboard":
+            handle_dashboard(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "continue":
+            handle_continue(argparse.Namespace(root=str(kata_root), notes_root=str(notes_root)))
+            Prompt.ask("\nPress Enter to return to menu")
+
+        elif action == "resume":
+            if not resume_slug:
+                console.print("[yellow]No recent kata to resume yet. Start a new session first.[/yellow]")
+                time.sleep(1.5)
+                continue
+            if not resume_dir or not resume_dir.exists():
+                console.print(f"[red]Last kata '{resume_slug}' not found at {resume_dir}.[/red]")
+                Prompt.ask("\nPress Enter to return to menu")
+                continue
+            # Concise summary panel
+            mission = (resume_dir / "MISSION.md").read_text().splitlines() if (resume_dir / "MISSION.md").exists() else []
+            readme = (resume_dir / "README.md").read_text().splitlines() if (resume_dir / "README.md").exists() else []
+            mission_line = ""
+            for line in mission:
+                clean = re.sub(r"^#+\s*", "", line).strip()
+                if clean:
+                    mission_line = clean
+                    break
+            if mission_line:
+                mission_line = re.sub(r"^Mission:\s*", "", mission_line, flags=re.IGNORECASE).strip()
+            if not mission_line and readme:
+                mission_line = readme[0].lstrip("# ").strip()
+            last_log_raw = last_lines(resume_dir / "LOG.md", 1) if (resume_dir / "LOG.md").exists() else "No prior logs."
+            last_log = summarize_text(last_log_raw.replace("\n", " "), 120)
+            summary_body = (
+                f"[bold]Kata:[/bold] {resume_dir.name}\n"
+                f"[bold]Mission:[/bold] {mission_line or 'No mission summary.'}\n"
+                f"[bold]Path:[/bold] {resume_dir.resolve()}\n"
+                f"[bold]Last activity:[/bold] {last_log}"
+            )
+            console.print(Panel(summary_body, title="Resume Last Kata", border_style="cyan"))
+
+            console.print("\n[bold]Choose an option:[/bold]")
+            console.print(" [bold cyan]1[/bold cyan] Resume now")
+            console.print(" [bold cyan]2[/bold cyan] Quick test preview, then resume")
+            console.print(" [bold cyan]3[/bold cyan] Return to menu\n")
+            choice = Prompt.ask(
+                "[italic grey50]Select an option [1-3]:[/italic grey50]",
+                choices=["1", "2", "3", ""],
+                default="1",
+                show_choices=False,
+            ) or "1"
+            if choice == "3":
+                console.print("[dim]Returning to menu...[/dim]")
+                time.sleep(0.8)
+                continue
+            if choice == "2":
+                passed, summary = quick_check_preview(resume_dir, notes_root)
+                style = "green" if passed else "red"
+                console.print(Panel(summary, title="Test Preview", border_style=style))
+                time.sleep(0.8)
+            console.print("[dim]Launching...[/dim]")
+            launch_session(resume_dir)
+            continue
+
+        elif action == "return_any_kata":
+            # Show all available katas for user to choose from
+            if not kata_root.exists():
+                console.print("[yellow]No katas found yet.[/yellow]")
+                time.sleep(1)
+                continue
+
+            available_katas = [d.name for d in kata_root.iterdir() if d.is_dir()]
+            if not available_katas:
+                console.print("[yellow]No katas found yet.[/yellow]")
+                time.sleep(1)
+                continue
+
+            console.clear()
+            console.print(Panel(
+                "[bold white]Select a Kata[/bold white]",
+                border_style="cyan",
+                padding=(1, 2)
+            ))
+            console.print()
+
+            for idx, kata_name in enumerate(sorted(available_katas), 1):
+                console.print(f"  [bold cyan]{idx}[/bold cyan] {kata_name}")
+            console.print()
+
+            choice = Prompt.ask(
+                f"Select kata [1-{len(available_katas)}]",
+                choices=[str(i) for i in range(1, len(available_katas) + 1)],
+                default="1",
+                show_choices=False
+            )
+
+            selected_kata = sorted(available_katas)[int(choice) - 1]
+            selected_dir = kata_root / selected_kata
+
+            if selected_dir.exists():
+                console.print(f"\n[dim]Launching {selected_kata}...[/dim]")
+                time.sleep(0.5)
+                launch_session(selected_dir)
+            continue
+
+        elif action == "scaffold_refresh":
+            project = Prompt.ask("Kata slug")
+            if project:
+                handle_scaffold_refresh(argparse.Namespace(project=project, root=str(kata_root)))
+                Prompt.ask("\nPress Enter to return to menu")
+            
+        elif action == "start_auto":
+            pillar = Prompt.ask("Focus pillar", choices=["python", "cli", "api", "testing", "mixed"], default="mixed")
+            mode = Prompt.ask("Mode", choices=["script", "api"], default="script")
+            template = "fastapi" if mode == "api" else "script"
+            level = Prompt.ask("Difficulty", choices=["foundation", "proficient", "stretch"], default="foundation")
+
+            with console.status("[bold green]Generating challenge idea...[/bold green]", spinner="dots"):
+                idea, _ = pick_idea_with_hints(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=kata_root,
+                    notes_root=notes_root,
+                    pillar_hint=pillar,
+                    level_hint=level,
+                    mode_hint=mode,
+                    offline=False,
+                )
+                
+            if not idea:
+                console.print("[red]Could not generate an idea.[/red]")
+                time.sleep(2)
+                continue
+
+            console.print(Panel(f"[bold]{idea}[/bold]", title="Proposed Kata", border_style="green"))
+            
+            if not Confirm.ask("Create this kata?", default=True):
+                console.print("Cancelled.")
+                continue
+
+            with console.status("[bold green]Creating workspace...[/bold green]", spinner="dots"):
+                handle_start(
+                    argparse.Namespace(
+                        idea=idea,
+                        template=template,
+                        root=str(kata_root),
+                        notes_root=str(notes_root),
+                        force=False,
+                        pillar=pillar,
+                        mode=mode,
+                        level=level,
+                        tests="edge",
+                        guided=False,
+                        reuse_settings=False,
+                        yes=True,
+                        scaffold="auto",
+                        offline=False,
+                    )
+                )
+            # handle_start prints next steps. We exit the menu so they can go code?
+            # Or we loop back?
+            # Typically user wants to exit menu to go to terminal.
+            # But let's ask.
+            if Confirm.ask("Exit menu to start coding?"):
+                return 0
+
+        elif action == "quick_train":
+            # ... (Existing Quick Train Logic) ...
+            # Reuse the vars we loaded at start of loop
+            current_xp = skills.get(weakest_pillar, 0)
+            level_title, _ = get_level_info(current_xp)
+            # Map skill level to difficulty hint for idea picker
+            difficulty = "foundation"
+            if level_title == "Journeyman":
+                difficulty = "proficient"
+            elif level_title in {"Expert", "Master"}:
+                difficulty = "stretch"
+            
+            target_mode = "fastapi" if weakest_pillar == "api" else "script"
+
+            console.print("[dim]> Analyzing skill profile...[/dim]")
+            rain_stop, rain_thread = start_matrix_rain(weakest_pillar, target_mode)
+            try:
+                idea, used_fallback = pick_idea_with_hints(
+                    provider=DEFAULT_IDEA_PROVIDER,
+                    model=DEFAULT_IDEA_MODEL,
+                    kata_root=Path(DEFAULT_KATA_ROOT),
+                    notes_root=Path(DEFAULT_NOTES_ROOT),
+                    pillar_hint=weakest_pillar,
+                    level_hint=difficulty,
+                    mode_hint=target_mode,
+                    offline=False,
+                )
+            finally:
+                stop_matrix_rain(rain_stop, rain_thread)
+            
+            if not idea:
+                console.print("[red]Could not generate an idea.[/red]")
+                time.sleep(2)
+                continue
+
+            console.print(Panel(f"[bold]{idea}[/bold]", title=f"⚡ Quick Train: {weakest_pillar.title()} ({difficulty})", border_style="yellow"))
+            
+            console.print("[dim]Launching in 3 seconds... (Ctrl+C to cancel)[/dim]")
+            try:
+                time.sleep(3)
+            except KeyboardInterrupt:
+                continue
+
+            handle_start(
+                argparse.Namespace(
+                    idea=idea,
+                    template="fastapi" if target_mode == "fastapi" else "script",
+                    root=str(DEFAULT_KATA_ROOT),
+                    notes_root=str(DEFAULT_NOTES_ROOT),
+                    force=False,
+                    pillar=weakest_pillar,
+                    mode=target_mode,
+                    level=difficulty,
+                    tests="edge",
+                    guided=False,
+                    reuse_settings=False,
+                    yes=True, 
+                    scaffold="auto",
+                    offline=False,
+                    launch=True, # Auto-launch
+                )
+            )
+            # Auto-exit to let them code
+            return 0
 
 
 def handle_idea(args: argparse.Namespace) -> int:
@@ -4576,24 +4656,16 @@ def apply_kata_scaffold(
     if overwrite_existing or not kata_md.exists():
         kata_md.write_text("\n".join(md_lines), encoding="utf-8")
 
-    mission_header_lines = build_mission_header_comments(target_dir)
-
     main_py = target_dir / "main.py"
     tests_path = tests_dir / "test_main.py"
     if template == "script":
-        main_lines: list[str] = []
-        if mission_header_lines:
-            main_lines.extend(mission_header_lines)
-            main_lines.append("")
-        main_lines.extend(
-            [
-                '"""Auto-generated scaffold stubs. Replace with your implementation."""',
-                "",
-                "def main() -> None:",
-                f"    print(\"{idea_title}: implement functions and run tests\")",
-                "",
-            ]
-        )
+        main_lines = [
+            '"""Auto-generated scaffold stubs. Replace with your implementation."""',
+            "",
+            "def main() -> None:",
+            f"    print(\"{idea_title}: implement functions and run tests\")",
+            "",
+        ]
         for fn in functions:
             signature = (fn.get("signature") or f"def {fn.get('name', 'task')}(*args, **kwargs)").strip()
             if not signature.startswith("def "):
@@ -4655,21 +4727,15 @@ def apply_kata_scaffold(
             test_lines.append("")
         if overwrite_existing or not tests_path.exists():
             tests_path.write_text("\n".join(test_lines), encoding="utf-8")
-    else:
-        main_lines = []
-        if mission_header_lines:
-            main_lines.extend(mission_header_lines)
-            main_lines.append("")
-        main_lines.extend(
-            [
+        else:
+            main_lines = [
                 '"""Auto-generated FastAPI scaffold. Fill in route logic."""',
                 "from fastapi import FastAPI, HTTPException",
                 "from pydantic import BaseModel",
-                "",
-                f"app = FastAPI(title=\"{idea_title}\")",
-                "",
-            ]
-        )
+            "",
+            f"app = FastAPI(title=\"{idea_title}\")",
+            "",
+        ]
         needs_payload = any(route.get("body_example") for route in routes)
         if needs_payload:
             main_lines.append("class StatsPayload(BaseModel):")
@@ -4833,29 +4899,21 @@ def seed_test_scaffold(target_dir: Path, template: str, idea_line: str, include_
             smoke_content = (
                 '"""Smoke tests for the generated FastAPI app."""\n'
                 "import importlib\n"
-                "import unittest\n"
                 "from fastapi import FastAPI\n\n"
-                "class SmokeTests(unittest.TestCase):\n"
-                "    def test_app_exposes_fastapi_instance(self) -> None:\n"
-                '        module = importlib.import_module("main")\n'
-                "        app = getattr(module, \"app\", None)\n"
-                "        self.assertIsInstance(app, FastAPI)\n\n"
-                "if __name__ == '__main__':\n"
-                "    unittest.main()\n"
+                "def test_app_exposes_fastapi_instance() -> None:\n"
+                '    module = importlib.import_module("main")\n'
+                "    app = getattr(module, \"app\", None)\n"
+                "    assert isinstance(app, FastAPI)\n"
             )
         else:
             smoke_content = (
                 '"""Smoke tests for the generated script kata."""\n'
-                "import importlib\n"
-                "import unittest\n\n"
-                "class SmokeTests(unittest.TestCase):\n"
-                "    def test_main_executes(self) -> None:\n"
-                '        module = importlib.import_module("main")\n'
-                "        main_fn = getattr(module, \"main\", None)\n"
-                "        if callable(main_fn):\n"
-                "            main_fn()\n\n"
-                "if __name__ == '__main__':\n"
-                "    unittest.main()\n"
+                "import importlib\n\n"
+                "def test_main_executes() -> None:\n"
+                '    module = importlib.import_module("main")\n'
+                "    main_fn = getattr(module, \"main\", None)\n"
+                "    if callable(main_fn):\n"
+                "        main_fn()\n"
             )
         smoke_path.write_text(smoke_content)
 
